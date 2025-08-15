@@ -1,0 +1,29 @@
+{
+  "name": "round-robin-odds-free",
+  "version": "1.4.3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2",
+    "@netlify/blobs": "^7.4.0",
+    "bcrypt": "npm:bcryptjs@^2.4.3",
+    "bcryptjs": "^2.4.3"
+  },
+  "devDependencies": {
+    "vite": "^5.4.19",
+    "@vitejs/plugin-react": "^4.3.2"
+  },
+  "overrides": {
+    "bcrypt": "npm:bcryptjs@^2.4.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
