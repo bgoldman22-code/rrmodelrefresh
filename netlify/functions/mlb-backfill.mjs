@@ -4,8 +4,8 @@
  * Query params:
  *   - start=YYYY-MM-DD  (required)
  *   - end=YYYY-MM-DD    (required)
- *   - pacems=150        (optional delay between days)
- *   - dry=1             (optional; if set, does dry-run calls)
+ *   - pacems=150        (optional; delay between days in ms; default 150)
+ *   - dry=1             (optional; preview only, no writes)
  *
  * Examples:
  *   /.netlify/functions/mlb-backfill?start=2025-04-01&end=2025-08-13
@@ -65,7 +65,9 @@ export default async (req) => {
     }
 
     const okCount = results.filter(x => x.ok).length;
-    return new Response(JSON.stringify({ ok:true, range:{ start:startS, end:endS, days:days.length }, okCount, results }, null, 2), { headers:{ "content-type":"application/json" }});
+    return new Response(JSON.stringify({ ok:true, range:{ start:startS, end:endS, days:days.length }, okCount, results }, null, 2), {
+      headers:{ "content-type":"application/json" }
+    });
   }catch(e){
     return new Response(JSON.stringify({ ok:false, error:String(e?.message||e) }), { status:200, headers:{ "content-type":"application/json" }});
   }
