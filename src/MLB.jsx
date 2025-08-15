@@ -79,6 +79,11 @@ export default function MLB(){
   const [meta, setMeta]   = useState({});
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
+  const all = (apiData || []).concat(players || []).concat(candidates || []).filter(Boolean);
+const { picks, message } = selectHRPicks(all);   // honors max 2/game, aims 12, floor 6
+setPicks(picks);
+if (message) setMessage(message);
+
 
   async function getCalibration(){
     try{ const j = await fetchJSON("/.netlify/functions/mlb-calibration"); return j?.global?.scale ? j : { global:{ scale:1.0 }, bins:[] }; }
