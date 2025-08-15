@@ -2,6 +2,70 @@
 import React, { useEffect, useState } from "react";
 import { selectHRPicks } from "./models/hr_select.js";
 
+// --- helpers: build odds index from props API ---
+async function fetchHROddsIndex(){
+  try{
+    const r = await fetch('/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us');
+    if(!r.ok) return new Map();
+    const data = await r.json();
+    const map = new Map();
+    if(Array.isArray(data?.events)){
+      for (const ev of data.events){
+        const gameCode = ev?.id || ev?.commence_time || ev?.home_team && ev?.away_team ? `${ev.away_team}@${ev.home_team}` : "";
+        for (const bk of (ev.bookmakers||[])){
+          for (const mk of (bk.markets||[])){
+            for (const out of (mk.outcomes||[])){
+              const player = (out.name||"").trim();
+              const price = Number(out.price_american ?? out.price?.american ?? out.price ?? NaN);
+              if (!player || !Number.isFinite(price)) continue;
+              const key = `${gameCode}|${player}`.toLowerCase();
+              if (!map.has(key) || Math.abs(price) < Math.abs(map.get(key))) map.set(key, price);
+            }
+          }
+        }
+      }
+    }
+    return map;
+  }catch{ return new Map(); }
+}
+
+function normalizeCandidates(raw){
+  const out = [];
+  if (!raw) return out;
+  const push = (obj) => {
+    if (!obj) return;
+    const name = obj.name || obj.player || obj.batter || "";
+    const team = obj.team || obj.teamAbbr || obj.team_abbr || obj.teamName || "";
+    const away = obj.away || obj.awayTeam || obj.away_team || "";
+    const home = obj.home || obj.homeTeam || obj.home_team || "";
+    const gameId = obj.gameId || obj.gamePk || obj.eventId || obj.event_id || obj.game || (away && home ? `${away}@${home}` : "");
+    out.push({
+      name, team,
+      away, home,
+      gameId,
+      oddsAmerican: obj.oddsAmerican ?? obj.odds_sim ?? null,
+      baseHRPA: obj.baseHRPA ?? obj.hr_base ?? obj.hr_prob_sim ?? null,
+      iso: obj.iso ?? obj.ISO ?? obj.seasonISO ?? obj.season_iso ?? null,
+      barrelRate: obj.barrelRate ?? obj.barrel_rate ?? obj.brls_pa ?? obj.barrels_per_pa ?? null,
+      recentHRperPA: obj.recentHRperPA ?? obj.hr_per_pa_l15 ?? obj.l15_hr_pa ?? null,
+      starterHR9: obj.starterHR9 ?? obj.pitcherHR9 ?? null,
+      venue: obj.venue || obj.park || obj.venueName || obj.venue_name || null,
+      platoonFlag: obj.platoonFlag ?? obj.platoon ?? null,
+      bvpPA: obj.bvpPA ?? obj.bvp_pa ?? 0,
+      bvpHR: obj.bvpHR ?? obj.bvp_hr ?? 0,
+      expPA: obj.expPA ?? obj.pa ?? 4
+    });
+  };
+  if (Array.isArray(raw)) raw.forEach(push);
+  else if (raw && typeof raw === 'object'){
+    if (Array.isArray(raw.candidates)) raw.candidates.forEach(push);
+    if (Array.isArray(raw.players)) raw.players.forEach(push);
+    if (Array.isArray(raw)) raw.forEach(push);
+  }
+  return out;
+}
+
+
 function americanToProb(odds){
   if (odds == null || isNaN(odds)) return null;
   const o = Number(odds);
@@ -193,4 +257,43 @@ export default function MLB(){
       )}
     </div>
   );
+}
+
+async function generatePicks(){
+  setLoading(true); setMessage(''); setPicks([]);
+  try{
+    // 1) fetch candidates from your odds-backed function
+    const baseRes = await fetch('/.netlify/functions/odds-mlb-hr');
+    if(!baseRes.ok) throw new Error(`odds-mlb-hr HTTP ${baseRes.status}`);
+    const baseJson = await baseRes.json();
+    let candidates = normalizeCandidates(baseJson);
+    if (!candidates.length) throw new Error('No candidates returned');
+
+    // 2) fetch market odds index and join
+    const hrIdx = await fetchHROddsIndex();
+    candidates = candidates.map(c => {
+      const key = `${c.gameId||''}|${c.name||''}`.toLowerCase();
+      const price = hrIdx.get(key);
+      return { ...c, oddsAmerican: Number.isFinite(price) ? price : (c.oddsAmerican ?? null) };
+    });
+
+    // 3) score and select
+    const scored = candidates.map(scoreHRPick);
+    const { picks, message } = selectHRPicks(scored);
+    setMessage(message || `Source: /.netlify/functions/odds-mlb-hr • Candidates: ${candidates.length}`);
+
+    // 4) shape for UI
+    const picksUI = picks.map(p => ({
+      name: p.name, team: p.team, game: (p.away && p.home)? `${p.away}@${p.home}` : (p.gameId||''),
+      modelProb: p.p_blended, modelAmerican: p.modelAmerican,
+      oddsAmerican: p.oddsAmerican ?? null,
+      why2: p.why2, reasons: p.reasons
+    }));
+    setPicks(picksUI);
+  }catch(e){
+    console.error(e);
+    setMessage(String(e?.message||e));
+  }finally{
+    setLoading(false);
+  }
 }

@@ -1,13 +1,14 @@
 // src/utils/mlb_today.js
 // Minimal StatsAPI helpers to (1) get today's schedule in ET, (2) rosters for today's teams, (3) pitcher HR/9.
 export function todayISO_ET(){
-  // Get today's date in America/New_York as YYYY-MM-DD
-  const now = new Date();
-  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-  // New York offset (doesn't handle DST perfectly in vanilla JS; we accept minor offset for daily fetch)
-  const offsetHours = -4; // EDT; if it's EST season, this may be -5
-  const ny = new Date(utc + offsetHours*3600*1000);
-  return ny.toISOString().split("T")[0];
+  // DST-proof ET date (YYYY-MM-DD) using Intl
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  return fmt.format(new Date());
 }
 
 async function fetchJSON(url){
