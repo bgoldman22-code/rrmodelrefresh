@@ -1,0 +1,12 @@
+
+1) Copy `src/models/hr_scoring.js` into your repo.
+2) In `src/MLB.jsx` (or the file that renders MLB HR page):
+   - Add at the top:   import { scoreHRPick } from "./models/hr_scoring.js";
+   - Find your existing `generatePicks` function and REPLACE it with the block from `mlb_generatePicks_paste.txt`.
+   - In your table, if you have a "Why" column, show `pick.why2` (2-sentence explanation).
+3) Deploy without cache.
+
+Notes
+- This model reduces EV-chasing and boosts true power hitters with matchup/park, with smaller weather effect.
+- It filters low-power profiles unless park/pitcher/streak give strong support.
+- It blends odds lightly (20%) and uses EV only as a tie-breaker.

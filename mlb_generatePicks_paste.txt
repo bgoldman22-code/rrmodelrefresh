@@ -1,0 +1,62 @@
+// --- BEGIN: DIALED-IN HR PICK GENERATOR (paste over your current generatePicks) ---
+async function generatePicks() {
+  if (!apiData || apiData.length === 0) {
+    setMessage('No candidate players with odds yet. Make sure odds and candidate feed are loaded.');
+    return;
+  }
+  setLoading(true); setMessage(''); setPicks([]);
+  try {
+    // Convert your candidate shape to the scoring shape:
+    const scored = apiData.map(c => scoreHRPick({
+      name: c.name,
+      team: c.team,
+      gameId: c.game || c.gameId,
+      oddsAmerican: c.odds_sim ?? c.oddsAmerican,
+      basePerPA: c.hr_base ?? c.hr_prob_sim ?? 0.06,
+      expPA: c.expPA ?? 4,
+      parkMult: c.parkMult ?? 1.0,
+      wxMult: c.wxMult ?? 1.0,
+      pitchMult: c.pitchMult ?? 1.0,
+      zoneMult: c.zoneMult ?? 1.0,
+      bvpMult: c.bvpMult ?? 1.0,
+      starterHR9: c.starterHR9,
+      lgHR9: c.lgHR9,
+      recentHR14: c.recentHR14,
+      recentPA14: c.recentPA14,
+      iso: c.iso, barrels: c.barrels,
+    }));
+
+    // Filter out low-power unless strong contextual support
+    const filtered = scored.filter(s => !s.filtered);
+
+    // Sort by BOMBS first (p_model), then blended prob, then EV as a tiebreaker
+    filtered.sort((a,b) => (b.p_model - a.p_model) || (b.p_blended - a.p_blended) || ((b.ev??-999) - (a.ev??-999)));
+
+    const selected = [];
+    const perGameCount = {};
+    for (const s of filtered) {
+      const g = s.gameId || s.game || "UNK";
+      if ((perGameCount[g]||0) >= 2) continue; // max 2 per game
+      selected.push(s);
+      perGameCount[g] = (perGameCount[g]||0)+1;
+      if (selected.length >= 12) break;
+    }
+    if (selected.length === 0) {
+      setMessage('No strong power candidates today after filtering. Try loosening the power floor or check candidate feed.');
+      setLoading(false); return;
+    }
+    // Shape back to your table fields
+    const picksUI = selected.map(s => ({
+      name: s.name, team: s.team, game: s.gameId || s.game || "",
+      hr_prob_sim: s.p_blended, odds_sim: Math.round(Number(s.oddsAmerican)||0),
+      ev: s.ev ?? 0, why2: s.reasons.join(" ")
+    }));
+    setPicks(picksUI);
+  } catch (e) {
+    console.error(e);
+    setMessage('Error generating picks with dialed-in model: ' + e.message);
+  } finally {
+    setLoading(false);
+  }
+}
+// --- END: DIALED-IN HR PICK GENERATOR ---
