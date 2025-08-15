@@ -1,0 +1,25 @@
+# Known-good Netlify config for this project
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["@netlify/blobs"]
+  included_files = []
+
+  # Run once each morning to prefill Blobs cache so pages don't burn quota
+[[scheduled.functions]]
+  name = "prewarm-odds"
+  # 13:00 UTC ≈ 9:00 AM America/New_York during Daylight Saving Time
+  cron = "0 13 * * *"
+
+
+# SPA fallback
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
