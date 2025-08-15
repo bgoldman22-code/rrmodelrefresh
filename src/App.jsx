@@ -11,6 +11,7 @@ import Soccer from "./Soccer.jsx";
 import MLB_SB from "./MLB_SB.jsx";
 import MLB_HITS2 from "./MLB_HITS2.jsx";
 import NFL_NegCorr from "./NFL_NegCorr.jsx";
+import FooterDiagnostics from "./components/FooterDiagnostics.jsx";
 
 export default function App() {
   return (
@@ -39,7 +40,10 @@ export default function App() {
             <Route path="/soccer" element={<Soccer />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
-        </div>
+        
+
+        <FooterDiagnostics />
+</div>
       </div>
     </BrowserRouter>
   );
