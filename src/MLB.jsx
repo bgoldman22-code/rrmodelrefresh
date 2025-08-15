@@ -23,6 +23,56 @@ async function fetchJSON(url){
   return r.json();
 }
 
+// Turn raw factor fields into 2-sentence human writeup
+function explainNarrative(c, baseProb, hcMul, calScale){
+  const parts = [];
+  // 1) Baseline power
+  const seasonHR = Number(c.seasonHR||0), seasonPA = Number(c.seasonPA||0);
+  const hrpa = seasonPA>0 ? (seasonHR/seasonPA) : 0;
+  const powerStr = hrpa>0 ? `${(hrpa*100).toFixed(1)}% HR/PA baseline` : `solid power baseline`;
+  const paStr = c.expPA ? `~${Number(c.expPA).toFixed(1)} PAs` : `~4 PAs`;
+  parts.push(`${c.name} projects from a ${powerStr} and ${paStr} today.`);
+
+  // 2) Contextual boosts
+  const ctx = [];
+  const park = Number(c.parkFactor||c.parkHR||1);
+  if(park>1.05) ctx.push(`hitter-friendly park (+${((park-1)*100).toFixed(0)}%)`);
+  if(park<0.95) ctx.push(`pitcher-friendly park (−${((1-park)*100).toFixed(0)}%)`);
+
+  const wx = Number(c.wxFactor||c.weatherFactor||1);
+  if(wx>1.03) ctx.push(`weather marginally helps carry`);
+  if(wx<0.97) ctx.push(`weather slightly suppresses carry`);
+
+  // Pitch mix / platoon
+  const pm = Number(c.pitchCompat||1);
+  if(pm>1.03) ctx.push(`favorable vs expected pitch mix`);
+  if(pm<0.97) ctx.push(`tough vs expected pitch mix`);
+
+  const zc = Number(c.zoneCompat||1);
+  if(zc>1.03) ctx.push(`hot zones align with pitcher’s locations`);
+  if(zc<0.97) ctx.push(`cold zones vs pitcher’s locations`);
+
+  // BvP
+  const bvpPA = Number(c.bvpPA||0), bvpHR = Number(c.bvpHR||0);
+  if(bvpPA>=6){
+    ctx.push(`BvP ${bvpHR} HR in ${bvpPA} PA`);
+  }
+
+  // Synthesize
+  if(ctx.length){
+    parts.push(`Context: ${ctx.slice(0,3).join(", ")}.`);
+  }else{
+    parts.push(`Context: neutral park/weather; model leans on skill and matchup.`);
+  }
+  // calibration/hot-cold tags
+  const tags = [];
+  if(Math.abs(hcMul-1)>0.01) tags.push(`form ${hcMul>1?"+":""}${((hcMul-1)*100).toFixed(0)}%`);
+  if(Math.abs(calScale-1)>0.01) tags.push(`cal ${calScale>1?"+":""}${((calScale-1)*100).toFixed(0)}%`);
+  if(tags.length) parts[1] += ` (${tags.join(", ")})`;
+
+  return parts.join(" ");
+}
+
 export default function MLB(){
   const [picks, setPicks] = useState([]);
   const [meta, setMeta]   = useState({});
@@ -82,30 +132,32 @@ export default function MLB(){
   }
 
   async function getOddsMap(){
-    try{
-      const j = await fetchJSON("/.netlify/functions/prewarm-odds-v2?market=player_home_run");
-      const map = new Map();
-      const arr = j?.data || j?.rows || [];
-      for(const r of arr){
-        if(r?.player && r?.best_american){
-          map.set(String(r.player).toLowerCase(), { american:r.best_american, book:r.book||"best" });
+    // Try our new function first, then fall back to your older prewarm function
+    const tryUrls = [
+      "/.netlify/functions/odds-mlb-hr",
+      "/.netlify/functions/prewarm-odds-v2?market=batter_home_runs"
+    ];
+    for(const url of tryUrls){
+      try{
+        const j = await fetchJSON(url);
+        const arr = j?.data || j?.rows || j?.outcomes || [];
+        const map = new Map();
+        for(const r of arr){
+          const key = String(r.player || r.name).toLowerCase();
+          const american = Number(r.best_american || r.american || r.price || r.odds_american);
+          if(key && !isNaN(american)){
+            map.set(key, { american, book: r.book || r.bookmaker || "best"});
+          }
         }
-      }
-      return map;
-    }catch{ return new Map(); }
+        if(map.size>0) return map;
+      }catch(e){ /* next */ }
+    }
+    return new Map();
   }
 
   function applyCalibration(p, scale){
     const scaled = Math.max(0.0005, Math.min(0.95, p * scale));
     return (1 - CAL_LAMBDA) * p + CAL_LAMBDA * scaled;
-  }
-
-  function explainRow(row){
-    const bits = [];
-    bits.push(`base ${(row.baseProb*100).toFixed(1)}%`);
-    if(row.hotBoost && Math.abs(row.hotBoost-1)>1e-3) bits.push(`hot/cold×${row.hotBoost.toFixed(2)}`);
-    if(row.calScale && Math.abs(row.calScale-1)>1e-3) bits.push(`cal×${row.calScale.toFixed(2)}`);
-    return bits.join(" • ");
   }
 
   async function build(){
@@ -121,24 +173,23 @@ export default function MLB(){
         if(!p || p<=0) continue;
         const hc = hotMap.get(String(c.batterId)) || { hr14:0, pa14:0 };
         const hcMul = hotColdMultiplier({ hr14:hc.hr14, pa14:hc.pa14, seasonHR:Number(c.seasonHR||0), seasonPA:Number(c.seasonPA||0) }, HOTCOLD_CAP);
-        p = p * hcMul;
         const calScale = Number(cals?.global?.scale || 1.0);
-        p = applyCalibration(p, calScale);
+        const pAdj = applyCalibration(p * hcMul, calScale);
 
         const key = String(c.name||"").toLowerCase();
         const found = oddsMap.get(key);
-        const american = found?.american ?? americanFromProb(p);
-        const ev = evFromProbAndOdds(p, american);
+        const american = found?.american ?? americanFromProb(pAdj);
+        const ev = evFromProbAndOdds(pAdj, american);
 
         rows.push({
           name: c.name,
           team: c.team,
           game: c.gameId || c.game || c.opp || "",
           batterId: c.batterId,
-          p_model: p,
+          p_model: pAdj,
           american,
           ev,
-          why: explainRow({ baseProb:Number(c.baseProb||c.prob||0), hotBoost:hcMul, calScale }),
+          why_narrative: explainNarrative(c, p, hcMul, calScale),
         });
       }
 
@@ -178,7 +229,7 @@ export default function MLB(){
   return (
     <div className="p-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">MLB HR — Calibrated + Hot/Cold + Odds-first EV</h1>
+        <h1 className="text-xl font-bold">MLB HR — Calibrated + Hot/Cold + OddsAPI EV + Narrative</h1>
         <button onClick={build} className="px-3 py-2 bg-blue-600 text-white rounded" disabled={loading}>
           {loading ? "Working..." : "Generate"}
         </button>
@@ -196,18 +247,18 @@ export default function MLB(){
               <th className="px-3 py-2 text-right">Model HR%</th>
               <th className="px-3 py-2 text-right">American</th>
               <th className="px-3 py-2 text-right">EV (1u)</th>
-              <th className="px-3 py-2 text-left">Why</th>
+              <th className="px-3 py-2 text-left w-[480px]">Why (2 sentences)</th>
             </tr>
           </thead>
           <tbody>
             {picks.map((r,i)=> (
-              <tr key={i} className="border-b">
+              <tr key={i} className="border-b align-top">
                 <td className="px-3 py-2">{r.name}</td>
                 <td className="px-3 py-2">{r.game}</td>
                 <td className="px-3 py-2 text-right">{(r.p_model*100).toFixed(1)}%</td>
                 <td className="px-3 py-2 text-right">{r.american>0?`+${r.american}`:r.american}</td>
                 <td className="px-3 py-2 text-right">{r.ev.toFixed(3)}</td>
-                <td className="px-3 py-2">{r.why}</td>
+                <td className="px-3 py-2">{r.why_narrative}</td>
               </tr>
             ))}
           </tbody>

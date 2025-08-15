@@ -1,4 +1,3 @@
-// src/utils/ev.js
 export function americanFromProb(p){
   const q = Math.min(0.999, Math.max(0.001, Number(p)||0));
   const dec = 1 / q;

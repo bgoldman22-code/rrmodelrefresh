@@ -1,4 +1,3 @@
-// src/utils/hotcold.js
 export function hotColdMultiplier({ hr14, pa14, seasonHR, seasonPA }, cap=0.06){
   const r14 = pa14 > 0 ? (hr14 / pa14) : 0;
   const rSeas = seasonPA > 0 ? (seasonHR / seasonPA) : 0;
