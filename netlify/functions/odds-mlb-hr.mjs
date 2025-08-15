@@ -1,65 +1,54 @@
 /** netlify/functions/odds-mlb-hr.mjs
- * Build a best-price map for MLB anytime HR props using the per-event endpoint.
- * Output: { ok:true, count, data:[{ player, best_american, book }] }
+ * OddsAPI → best price per player for MLB anytime HR using per-event endpoint.
+ * Call: /.netlify/functions/odds-mlb-hr
  */
 function ok(data){ return new Response(JSON.stringify(data), { headers:{ "content-type":"application/json" }}); }
 function getKey(){ return process.env.VITE_ODDS_API_KEY || process.env.ODDS_API_KEY || process.env.ODDSAPI_KEY; }
 async function fetchJSON(url){
   const r = await fetch(url, { headers:{ "accept":"application/json" }});
-  if(!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+  if(!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 function iso(d){ return new Date(d).toISOString(); }
-function startOfDayUTC(d){
-  const dt = new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(), 0,0,0));
-}
-function endOfDayUTC(d){
-  const dt = new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(), 23,59,59));
-}
-function toAmerican(o){ return Number(o?.price || o?.oddsAmerican || o?.odds_american || o?.american); }
-function playerFromOutcome(o){ return o?.description || o?.participant || o?.player || o?.name_secondary || o?.selection || o?.name; }
+function startOfDayUTC(d){ const dt=new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),0,0,0)); }
+function endOfDayUTC(d){ const dt=new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),23,59,59)); }
 
 export default async () => {
-  try{
-    const key = getKey();
-    if(!key) return ok({ ok:false, error:"missing-api-key" });
+  const key = getKey();
+  if(!key) return ok({ ok:false, error:"missing-api-key" });
 
-    const sport = "baseball_mlb";
-    const base  = `https://api.the-odds-api.com/v4/sports/${sport}`;
-    const now = new Date();
-    const from = startOfDayUTC(now);
-    const to   = endOfDayUTC(now);
-    const eventsURL = `${base}/events?commenceTimeFrom=${encodeURIComponent(iso(from))}&commenceTimeTo=${encodeURIComponent(iso(to))}&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
-    let events=[];
-    try{ events = await fetchJSON(eventsURL); }catch(e){ return ok({ ok:false, stage:"events", error:String(e?.message||e) }); }
-    if(!Array.isArray(events)) events=[];
+  const sport="baseball_mlb";
+  const base = `https://api.the-odds-api.com/v4/sports/${sport}`;
+  const now=new Date();
+  const from=startOfDayUTC(now), to=endOfDayUTC(now);
+  const eventsURL = `${base}/events?commenceTimeFrom=${encodeURIComponent(iso(from))}&commenceTimeTo=${encodeURIComponent(iso(to))}&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
 
-    const best = new Map();
-    for(const ev of events){
-      const id = ev?.id; if(!id) continue;
+  let events=[]; try{ events=await fetchJSON(eventsURL);}catch(e){ return ok({ ok:false, stage:"events", error:String(e?.message||e) }); }
+  const best=new Map();
+  for(const e of (Array.isArray(events)?events:[])){
+    const id=e?.id; if(!id) continue;
+    let data; try{
       const url = `${base}/events/${id}/odds?regions=us,us2&oddsFormat=american&markets=batter_home_runs&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
-      let data; try{ data = await fetchJSON(url); }catch{ continue; }
-      for(const b of (data?.bookmakers||[])){
-        for(const mk of (b?.markets||[])){
-          if(mk?.key!=="batter_home_runs") continue;
-          for(const o of (mk?.outcomes||[])){
-            const name = String(o?.name||"").toLowerCase();
-            const point = (o?.point==null || Number.isNaN(Number(o?.point))) ? null : Number(o?.point);
-            if(!(name==="over" && point===0.5)) continue;
-            const player = playerFromOutcome(o);
-            const american = toAmerican(o);
-            if(!player || Number.isNaN(american)) continue;
-            const k = player.toLowerCase();
-            const prev = best.get(k);
-            if(!prev || american > prev.best_american){
-              best.set(k, { player, best_american: american, book: b?.title || "book" });
-            }
+      data = await fetchJSON(url);
+    }catch{ continue; }
+    for(const b of (data?.bookmakers||[])){
+      for(const mk of (b?.markets||[])){
+        if(mk?.key!=="batter_home_runs") continue;
+        for(const out of (mk?.outcomes||[])){
+          const name=String(out?.name||"").toLowerCase();
+          const point=(out?.point==null||Number.isNaN(Number(out?.point)))?null:Number(out?.point);
+          if(!(name==="over" && point===0.5)) continue;
+          const player = out?.description || out?.participant || out?.player || out?.name_secondary || out?.selection || out?.name;
+          const american = Number(out?.price || out?.oddsAmerican || out?.odds_american || out?.american);
+          if(!player || Number.isNaN(american)) continue;
+          const k = player.toLowerCase();
+          const prev = best.get(k);
+          if(!prev || american>prev.best_american){
+            best.set(k, { player, best_american: american, book: b?.title||"book" });
           }
         }
       }
     }
-    return ok({ ok:true, count: best.size, data: [...best.values()] });
-  }catch(e){
-    return ok({ ok:false, error:String(e?.message||e) });
   }
+  return ok({ ok:true, count: best.size, data: [...best.values()] });
 };
