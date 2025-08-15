@@ -1,11 +1,12 @@
 /** netlify/functions/odds-mlb-hr.mjs
- * Pull MLB anytime-HR prices from TheOddsAPI.
- * Strategy: query market 'batter_home_runs' (Over/Under) and take Over with point=0.5 as anytime HR.
- * Return best american price per player across US books.
- *
- * Env: VITE_ODDS_API_KEY or ODDS_API_KEY
+ * Robust MLB anytime-HR odds from TheOddsAPI.
+ * - Tries multiple likely market keys: batter_home_runs, player_home_runs, player_to_hit_a_home_run
+ * - Accepts Over 0.5 OR Yes
+ * - Returns best (longest) American price per player
  */
-const BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/";
+const SPORT = "baseball_mlb";
+const BASE  = `https://api.the-odds-api.com/v4/sports/${SPORT}/odds`;
+const MARKETS = ["batter_home_runs","player_home_runs","player_to_hit_a_home_run"];
 function ok(data){ return new Response(JSON.stringify(data), { headers:{ "content-type":"application/json" }}); }
 async function fetchJSON(url){
   const r = await fetch(url, { headers:{ "accept":"application/json" }});
@@ -15,37 +16,49 @@ async function fetchJSON(url){
 function getKey(){
   return process.env.VITE_ODDS_API_KEY || process.env.ODDS_API_KEY || process.env.ODDSAPI_KEY;
 }
+function getPlayerName(o){
+  return o?.description || o?.participant || o?.player || o?.name_secondary || o?.selection || o?.name;
+}
+function getAmerican(o){
+  return Number(o?.price || o?.oddsAmerican || o?.odds_american || o?.american);
+}
 
-export default async (req) => {
+export default async () => {
   try{
     const key = getKey();
     if(!key) return ok({ ok:false, error:"missing-api-key" });
 
-    const url = `${BASE}?regions=us,us2&oddsFormat=american&markets=batter_home_runs&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
-    const data = await fetchJSON(url);
-
     const best = new Map();
-    for(const ev of data){
-      const markets = ev?.bookmakers?.flatMap(b => (b?.markets||[]).map(m => ({...m, book:b?.title}))) || [];
-      for(const m of markets){
-        if(m?.key !== "batter_home_runs") continue;
-        for(const o of (m?.outcomes||[])){
-          // Expect: Over/Under structure with "point" (e.g., 0.5). We want Over 0.5
-          if(String(o?.name).toLowerCase() !== "over") continue;
-          if(Number(o?.point) !== 0.5) continue;
-          const player = o?.description || o?.participant || o?.name_secondary || o?.player;
-          const american = Number(o?.price || o?.oddsAmerican || o?.odds_american || o?.american);
-          if(!player || isNaN(american)) continue;
-          const k = String(player).toLowerCase();
-          const prev = best.get(k);
-          // choose the LONGER price (better payout) for the bettor
-          if(!prev || american > prev.best_american){
-            best.set(k, { player, best_american: american, book: m.book || "book" });
+    for(const m of MARKETS){
+      const url = `${BASE}?regions=us,us2&oddsFormat=american&markets=${encodeURIComponent(m)}&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
+      let data = [];
+      try{ data = await fetchJSON(url); }catch{ continue; }
+
+      for(const ev of (data||[])){
+        const books = ev?.bookmakers||[];
+        for(const b of books){
+          const markets = b?.markets||[];
+          for(const mk of markets){
+            if(mk?.key !== m) continue;
+            for(const o of (mk?.outcomes||[])){
+              const name = (o?.name||"").toLowerCase();
+              const point = Number(o?.point);
+              const anytime = (name === "over" && point === 0.5) || (name === "yes" && (!("point" in o) || isNaN(point)));
+              if(!anytime) continue;
+              const player = getPlayerName(o);
+              const american = getAmerican(o);
+              if(!player || isNaN(american)) continue;
+              const k = String(player).toLowerCase();
+              const prev = best.get(k);
+              if(!prev || american > prev.best_american){
+                best.set(k, { player, best_american: american, book: b?.title || "book" });
+              }
+            }
           }
         }
       }
     }
-    return ok({ ok:true, count: best.size, data: [...best.values()] });
+    return ok({ ok:true, count: best.size, data: [...best.values()], marketsTried: MARKETS });
   }catch(e){
     return ok({ ok:false, error:String(e?.message||e) });
   }
