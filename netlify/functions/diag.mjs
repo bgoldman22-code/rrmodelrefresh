@@ -36,7 +36,11 @@ export default async (req) => {
       return n>0 ? { status:"green", detail:`${n} comps` } : { status:"yellow", detail:"0 comps" };
     }),
     check("odds_prewarm", async () => {
-      const r = await fetch(`${origin}/.netlify/functions/prewarm-odds?dry=1`);
+      // Try v2 first
+      let r = await fetch(`${origin}/.netlify/functions/prewarm-odds-v2?dry=1`);
+      if(r.status === 404){
+        r = await fetch(`${origin}/.netlify/functions/prewarm-odds?dry=1`);
+      }
       if(!r.ok) return { status:"red", detail:`HTTP ${r.status}` };
       const j = await r.json().catch(()=> ({}));
       return (j && (j.ok || j.status==="ok")) ? { status:"green", detail:"ok" } : { status:"yellow", detail:"resp" };
@@ -59,10 +63,14 @@ export default async (req) => {
       }
     }),
     check("mlb_daily_learn", async () => {
-      const r = await fetch(`${origin}/.netlify/functions/mlb-daily-learn?dry=1&date=${encodeURIComponent(date)}`);
+      // Try v2 first, then fallback
+      let r = await fetch(`${origin}/.netlify/functions/mlb-learner-v2?dry=1&date=${encodeURIComponent(date)}`);
+      if(r.status === 404){
+        r = await fetch(`${origin}/.netlify/functions/mlb-daily-learn?dry=1&date=${encodeURIComponent(date)}`);
+      }
       if(!r.ok) return { status:"red", detail:`HTTP ${r.status}` };
       const j = await r.json().catch(()=> ({}));
-      if(j && (j.ok || typeof j.games === "number" || typeof j.samples === "number")) return { status:"green", detail:"ok" };
+      if(j && (j.ok || typeof j.games === "number" || typeof j.samples === "number" || j.version === "v2-shim")) return { status:"green", detail:"ok" };
       return { status:"yellow", detail:"resp" };
     }),
   ]);
