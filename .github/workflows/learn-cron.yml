@@ -1,0 +1,36 @@
+name: Daily Learners (ET)
+
+on:
+  schedule:
+    # Run around 9:05 AM Eastern year-round (two crons cover DST vs Standard Time)
+    - cron: '5 13 * * *'   # ~09:05 ET during Daylight Saving Time
+    - cron: '5 14 * * *'   # ~09:05 ET during Standard Time
+  workflow_dispatch: {}     # lets you run it manually from the Actions tab
+
+jobs:
+  run-daily-learners:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure SITE_BASE_URL is set
+        run: |
+          if [ -z "${{ secrets.SITE_BASE_URL }}" ]; then
+            echo "::error::Set repository secret SITE_BASE_URL to your deployed site URL (e.g., https://bgroundrobin.com)"
+            exit 1
+          fi
+          echo "Using SITE_BASE_URL=${{ secrets.SITE_BASE_URL }}"
+
+      - name: MLB learner (yesterday ET)
+        run: |
+          set -e
+          URL="${{ secrets.SITE_BASE_URL }}/.netlify/functions/mlb-learner-v2"
+          echo "GET $URL"
+          curl -sS -H 'Accept: application/json' "$URL" | tee mlb-learner.json
+          echo "::notice::MLB learner response saved to mlb-learner.json"
+
+      - name: (Optional) Prewarm Odds (dry)
+        run: |
+          set -e
+          URL="${{ secrets.SITE_BASE_URL }}/.netlify/functions/prewarm-odds-v2?dry=1"
+          echo "GET $URL"
+          curl -sS -H 'Accept: application/json' "$URL" | tee odds-prewarm.json || true
+          echo "::notice::Odds prewarm response saved to odds-prewarm.json"
