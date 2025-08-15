@@ -1,4 +1,4 @@
-// Eastern Time date helper used by diagnostics and pages
+// ET helper used by diagnostics
 export function todayISO_ET(){
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",

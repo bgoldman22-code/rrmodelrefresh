@@ -69,7 +69,6 @@ export default async (req) => {
       const greenIf = (item.samples>0 || item.daysLearned>0 || item.picksToday || item.func.reachable);
       if(greenIf) item.status = "green";
       if(!item.func.reachable && !item.picksToday && item.samples===0) item.status = "yellow"; // unknown but not broken
-      if(item.func.reachable === false && item.samples===0 && !item.picksToday) item.status = "yellow"; // still not hard red
 
       out.models[m.key] = item;
     }

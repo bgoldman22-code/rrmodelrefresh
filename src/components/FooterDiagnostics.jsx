@@ -1,0 +1,12 @@
+import React from "react";
+import DiagnosticsBar from "./DiagnosticsBar.jsx";
+import LearningDiagnostics from "./LearningDiagnostics.jsx";
+
+export default function FooterDiagnostics(){
+  return (
+    <div className="mt-10 space-y-3">
+      <DiagnosticsBar />
+      <LearningDiagnostics />
+    </div>
+  );
+}
