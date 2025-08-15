@@ -1,8 +1,66 @@
 // src/MLB.jsx
 import React, { useEffect, useState } from "react";
 import { selectHRPicks } from "./models/hr_select.js";
+import { scoreHRPick } from "./models/hr_scoring.js";
 
-// --- helpers: build odds index from props API ---
+function americanToProb(odds){
+  if (odds == null || isNaN(odds)) return null;
+  const o = Number(odds);
+  return o > 0 ? (100 / (o + 100)) : (Math.abs(o) / (Math.abs(o) + 100));
+}
+function americanFromProb(p){
+  const adj = Math.max(0.001, Math.min(0.999, p));
+  if (adj >= 0.5) return -Math.round(100 * adj / (1 - adj));
+  return Math.round(100 * (1 - adj) / adj);
+}
+
+function normalizeCandidates(raw){
+  const out = [];
+  if (!raw) return out;
+
+  const push = (obj) => {
+    if (!obj) return;
+    const name = obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "";
+    const home = obj.home || obj.home_team || obj.homeTeam || obj.teamHome;
+    const away = obj.away || obj.away_team || obj.awayTeam || obj.teamAway || obj.opponent;
+    const eventId = obj.eventId || obj.event_id || obj.id || obj.gameId || obj.gamePk;
+    const game = obj.game || obj.gameId || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
+    const team = obj.team || obj.playerTeam || obj.team_abbr || obj.teamAbbr || "";
+    const odds = obj.oddsAmerican ?? obj.odds ?? obj.price ?? obj.american ?? null;
+    const impliedProb = obj.impliedProb ?? americanToProb(odds);
+
+    out.push({
+      id: obj.id || obj.playerId || `${name}|${game}`,
+      name,
+      team,
+      opponent: (team && home && team===home) ? away : home,
+      home, away,
+      game, eventId,
+      oddsAmerican: (odds != null ? Number(odds) : null),
+      impliedProb,
+      // modeling features (accept many aliases)
+      baseHRPA: obj.baseHRPA ?? obj.hr_base ?? obj.hr_prob_sim ?? null,
+      expPA: obj.expPA ?? obj.pa ?? 4,
+      venue: obj.venue || obj.park || obj.venueName || obj.venue_name || null,
+      starterHR9: obj.starterHR9 ?? obj.pitcherHR9 ?? obj.oppStarterHR9 ?? null,
+      bvpHR: obj.bvpHR ?? obj.bvp_hr ?? 0, bvpPA: obj.bvpPA ?? obj.bvp_pa ?? 0,
+      iso: obj.iso ?? obj.ISO ?? obj.seasonISO ?? obj.season_iso ?? null,
+      barrelRate: obj.barrelRate ?? obj.barrel_rate ?? obj.brls_pa ?? obj.barrels_per_pa ?? null,
+      recentHRperPA: obj.recentHRperPA ?? obj.hr_per_pa_l15 ?? obj.l15_hr_pa ?? 0,
+      platoonFlag: obj.platoonFlag ?? obj.platoon ?? null,
+    });
+  };
+
+  // Accept multiple container shapes
+  if (Array.isArray(raw)) raw.forEach(push);
+  else if (raw && typeof raw === "object"){
+    if (Array.isArray(raw.candidates)) raw.candidates.forEach(push);
+    if (Array.isArray(raw.players)) raw.players.forEach(push);
+    if (Array.isArray(raw.events)) raw.events.forEach(push);
+  }
+  return out;
+}
+
 async function fetchHROddsIndex(){
   try{
     const r = await fetch('/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us');
@@ -11,12 +69,12 @@ async function fetchHROddsIndex(){
     const map = new Map();
     if(Array.isArray(data?.events)){
       for (const ev of data.events){
-        const gameCode = ev?.id || ev?.commence_time || ev?.home_team && ev?.away_team ? `${ev.away_team}@${ev.home_team}` : "";
+        const gameCode = (ev?.home_team && ev?.away_team) ? `${ev.away_team}@${ev.home_team}` : (ev?.id || ev?.commence_time || "");
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
-            for (const out of (mk.outcomes||[])){
-              const player = (out.name||"").trim();
-              const price = Number(out.price_american ?? out.price?.american ?? out.price ?? NaN);
+            for (const oc of (mk.outcomes||[])){
+              const player = (oc.name || oc.description || oc.participant || "").trim();
+              const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
               if (!player || !Number.isFinite(price)) continue;
               const key = `${gameCode}|${player}`.toLowerCase();
               if (!map.has(key) || Math.abs(price) < Math.abs(map.get(key))) map.set(key, price);
@@ -26,77 +84,21 @@ async function fetchHROddsIndex(){
       }
     }
     return map;
-  }catch{ return new Map(); }
-}
-
-function americanToProb(odds){
-  if (odds == null || isNaN(odds)) return null;
-  const o = Number(odds);
-  return o > 0 ? (100 / (o + 100)) : (Math.abs(o) / (Math.abs(o) + 100));
-}
-
-function normalizeCandidates(raw){
-  const out = [];
-  if (!raw) return out;
-
-  const push = (obj) => {
-    if (!obj) return;
-    const name = obj.name || obj.player || obj.description || obj.outcome || obj.playerName;
-    const home = obj.home || obj.home_team || obj.homeTeam;
-    const away = obj.away || obj.away_team || obj.awayTeam;
-    const eventId = obj.eventId || obj.event_id || obj.id || obj.gameId;
-    const game = obj.game || obj.gameId || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
-    const team = obj.team || obj.playerTeam || obj.team_abbr;
-    const odds = obj.odds ?? obj.price ?? obj.american ?? null;
-    const impliedProb = obj.impliedProb ?? americanToProb(odds);
-    out.push({
-      id: obj.id || obj.playerId || name,
-      name,
-      team,
-      opponent: (team && home && team===home) ? away : home,
-      home, away,
-      game, eventId,
-      odds, impliedProb,
-      baseHRPA: obj.baseHRPA,
-      expPA: obj.expPA,
-      parkFactor: obj.parkFactor,
-      weatherFactor: obj.weatherFactor,
-      starterHR9: obj.starterHR9,
-      bvpHR: obj.bvpHR, bvpPA: obj.bvpPA,
-      iso: obj.iso, barrelRate: obj.barrelRate,
-      recentHR14: obj.recentHR14, recentPA14: obj.recentPA14,
-      pitchCompat: obj.pitchCompat, zoneCompat: obj.zoneCompat,
-    });
-  };
-
-  if (Array.isArray(raw)){ raw.forEach(push); return out; }
-
-  if (Array.isArray(raw.events)){
-    for (const ev of raw.events){
-      const home = ev.home_team || ev.homeTeam || ev.home;
-      const away = ev.away_team || ev.awayTeam || ev.away;
-      const eventId = ev.id || ev.event_id || ev.key || ev.commence_time;
-      const game = `${String(away||"AWY").trim()}@${String(home||"HOM").trim()}`;
-      if (!Array.isArray(ev.bookmakers)) continue;
-      for (const bk of ev.bookmakers){
-        if (!Array.isArray(bk.markets)) continue;
-        for (const mk of bk.markets){
-          if (!Array.isArray(mk.outcomes)) continue;
-          for (const oc of mk.outcomes){
-            const name = oc.description || oc.participant || oc.name;
-            const odds = oc.price ?? oc.american ?? oc.odds;
-            push({ name, home, away, eventId, game, odds });
-          }
-        }
-      }
-    }
-    return out;
+  }catch{
+    return new Map();
   }
+}
 
-  if (Array.isArray(raw.data)){ raw.data.forEach(push); return out; }
-
-  Object.values(raw).forEach(v => { if (Array.isArray(v)) v.forEach(push); });
-  return out;
+function gamesSeen(cands){
+  const set = new Set();
+  for (const x of cands){
+    const home = x.home || x.home_team || x.homeTeam;
+    const away = x.away || x.away_team || x.awayTeam || x.opponent;
+    const game = x.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
+    const key = (x.eventId || x.event_id || x.gameId) ? `${game}#${x.eventId || x.event_id || x.gameId}` : game;
+    set.add(key);
+  }
+  return set.size;
 }
 
 export default function MLB(){
@@ -105,111 +107,97 @@ export default function MLB(){
   const [loading, setLoading] = useState(false);
   const [diag, setDiag] = useState({ source:"", count:0, games:0 });
 
-  async function tryFetch(url){
+  async function generate(){
+    setLoading(true); setMessage(""); setPicks([]);
     try{
-      const r = await fetch(url);
-      if (!r.ok) return null;
-      const j = await r.json();
-      return j;
+      // 1) Get candidates from your Netlify function
+      const baseRes = await fetch('/.netlify/functions/odds-mlb-hr');
+      if(!baseRes.ok) throw new Error(`odds-mlb-hr HTTP ${baseRes.status}`);
+      const baseJson = await baseRes.json();
+      let cands = normalizeCandidates(baseJson);
+      if (!cands.length) throw new Error('No candidates returned');
+
+      // 2) Join live HR odds
+      const idx = await fetchHROddsIndex();
+      cands = cands.map(c => {
+        const key = `${c.game}|${c.name}`.toLowerCase();
+        const joined = idx.get(key);
+        return { ...c, oddsAmerican: Number.isFinite(joined) ? joined : c.oddsAmerican };
+      });
+
+      // 3) Score and select
+      const scored = cands.map(scoreHRPick);
+      const { picks: chosen, message: chooseMsg } = selectHRPicks(scored);
+      setDiag({ source: "/.netlify/functions/odds-mlb-hr", count: cands.length, games: gamesSeen(cands) });
+      setMessage(chooseMsg || "");
+
+      // 4) Shape for UI
+      const ui = chosen.map(p => ({
+        name: p.name,
+        team: p.team,
+        game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || ""),
+        modelProb: p.p_blended ?? p.p_model ?? null,
+        modelAmerican: p.modelAmerican ?? (p.p_blended ? americanFromProb(p.p_blended) : null),
+        oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
+        why: p.why2 || (Array.isArray(p.reasons) ? p.reasons.join(" • ") : ""),
+      }));
+      setPicks(ui);
     }catch(e){
-      return null;
-    }
-  }
-
-  function countGames(list){
-    const set = new Set();
-    for (const x of list){
-      const home = x.home || x.home_team || x.homeTeam;
-      const away = x.away || x.away_team || x.awayTeam || x.opponent;
-      const game = x.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
-      const key = (x.eventId || x.event_id || x.gameId) ? `${game}#${x.eventId || x.event_id || x.gameId}` : game;
-      set.add(key);
-    }
-    return set.size;
-  }
-
-  async function loadAndScore(){
-    setLoading(true);
-    setMessage("");
-    setPicks([]);
-    const sources = [
-      "/.netlify/functions/mlb-candidates",
-      "/.netlify/functions/odds-mlb-hr",
-      "/.netlify/functions/odds-mlb-hr-sgo"
-    ];
-    let raw = null, src = "";
-    for (const s of sources){
-      const j = await tryFetch(s);
-      if (j && (Array.isArray(j) || j.events || j.data)) { raw = j; src = s; break; }
-    }
-    if (!raw && Array.isArray(window.__MLB_POOL__)) { raw = window.__MLB_POOL__; src = "window.__MLB_POOL__"; }
-
-    if (!raw){
-      setMessage("No candidate endpoint returned players.");
+      console.error(e);
+      setMessage(String(e?.message||e));
+    }finally{
       setLoading(false);
-      return;
     }
-
-    const cands = normalizeCandidates(raw);
-    setDiag({ source: src, count: cands.length, games: countGames(cands) });
-
-    const { picks: nextPicks, message: statusMsg } = selectHRPicks(cands);
-    setPicks(nextPicks);
-    if (statusMsg) setMessage(statusMsg);
-    setLoading(false);
   }
 
-  useEffect(() => { loadAndScore(); }, []);
+  useEffect(()=>{
+    // Auto-generate on first mount to save clicks
+    generate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
-    <div className="p-6 max-w-6xl mx-auto">
-      <div className="flex items-baseline justify-between mb-4">
-        <h1 className="text-2xl font-bold">MLB Home Run Round Robin</h1>
-        <button
-          onClick={loadAndScore}
-          className="px-4 py-2 bg-blue-600 text-white rounded-md shadow hover:bg-blue-700"
-          disabled={loading}
-        >
-          {loading ? "Loading…" : "Regenerate"}
-        </button>
-      </div>
-
-      <p className="text-sm text-gray-600 mb-2">
-        Source: <span className="font-mono">{diag.source || "—"}</span> • Candidates: {diag.count} • Games seen: {diag.games}
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-2">MLB — Home Run Picks</h1>
+      <p className="text-sm text-gray-600 mb-4">
+        Source: {diag.source || "—"} • Candidates: {diag.count} • Games seen: {diag.games}
       </p>
 
-      {message && (
-        <div className="mb-4 text-amber-800 bg-amber-100 border border-amber-200 rounded px-3 py-2">
-          {message}
-        </div>
-      )}
+      <div className="flex items-center gap-3 mb-4">
+        <button
+          className="px-4 py-2 bg-blue-600 text-white rounded-md shadow hover:bg-blue-700 disabled:opacity-60"
+          onClick={generate}
+          disabled={loading}
+        >
+          {loading ? "Generating…" : "Generate"}
+        </button>
+        {message ? <span className="text-sm text-gray-700">{message}</span> : null}
+      </div>
 
-      {picks.length > 0 ? (
-        <div className="overflow-x-auto rounded-lg shadow">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
+      {picks.length ? (
+        <div className="overflow-x-auto">
+          <table className="min-w-full border">
+            <thead className="bg-gray-100">
               <tr>
-                <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Player</th>
-                <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Team</th>
-                <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Game</th>
-                <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Model HR Prob</th>
-                <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Model Odds</th>
-                <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Why</th>
+                <th className="px-4 py-2 text-left">Player</th>
+                <th className="px-4 py-2 text-left">Team</th>
+                <th className="px-4 py-2 text-left">Game</th>
+                <th className="px-4 py-2 text-left">Model HR Prob</th>
+                <th className="px-4 py-2 text-left">Model Odds</th>
+                <th className="px-4 py-2 text-left">Live Odds</th>
+                <th className="px-4 py-2 text-left">Why</th>
               </tr>
             </thead>
-            <tbody className="bg-white divide-y divide-gray-200">
-              {picks.map((p, i) => (
-                <tr key={i}>
-                  <td className="px-4 py-2 whitespace-nowrap">{p.name || "—"}</td>
-                  <td className="px-4 py-2 whitespace-nowrap">{p.team || "—"}</td>
-                  <td className="px-4 py-2 whitespace-nowrap">{p.game || `${p.away||"AWY"}@${p.home||"HOM"}`}</td>
-                  <td className="px-4 py-2 whitespace-nowrap">{(100*(p.p_model ?? p.p_blended ?? 0)).toFixed(1)}%</td>
-                  <td className="px-4 py-2 whitespace-nowrap">
-                    {p.odds != null ? (p.odds>0?`+${p.odds}`:`${p.odds}`) : "—"}
-                  </td>
-                  <td className="px-4 py-2 text-sm text-gray-600">
-                    {p.why2 || (p.reasons ? p.reasons.join(" • ") : "—")}
-                  </td>
+            <tbody>
+              {picks.map((p, idx) => (
+                <tr key={idx} className="border-t">
+                  <td className="px-4 py-2">{p.name}</td>
+                  <td className="px-4 py-2">{p.team || "—"}</td>
+                  <td className="px-4 py-2">{p.game || "—"}</td>
+                  <td className="px-4 py-2">{p.modelProb != null ? (p.modelProb*100).toFixed(1) + "%" : "—"}</td>
+                  <td className="px-4 py-2">{p.modelAmerican != null ? (p.modelAmerican>0?`+${p.modelAmerican}`:p.modelAmerican) : "—"}</td>
+                  <td className="px-4 py-2">{p.oddsAmerican != null ? (p.oddsAmerican>0?`+${p.oddsAmerican}`:p.oddsAmerican) : "—"}</td>
+                  <td className="px-4 py-2 text-sm text-gray-700">{p.why || "—"}</td>
                 </tr>
               ))}
             </tbody>
@@ -220,43 +208,4 @@ export default function MLB(){
       )}
     </div>
   );
-}
-
-async function generatePicks(){
-  setLoading(true); setMessage(''); setPicks([]);
-  try{
-    // 1) fetch candidates from your odds-backed function
-    const baseRes = await fetch('/.netlify/functions/odds-mlb-hr');
-    if(!baseRes.ok) throw new Error(`odds-mlb-hr HTTP ${baseRes.status}`);
-    const baseJson = await baseRes.json();
-    let candidates = normalizeCandidates(baseJson);
-    if (!candidates.length) throw new Error('No candidates returned');
-
-    // 2) fetch market odds index and join
-    const hrIdx = await fetchHROddsIndex();
-    candidates = candidates.map(c => {
-      const key = `${c.gameId||''}|${c.name||''}`.toLowerCase();
-      const price = hrIdx.get(key);
-      return { ...c, oddsAmerican: Number.isFinite(price) ? price : (c.oddsAmerican ?? null) };
-    });
-
-    // 3) score and select
-    const scored = candidates.map(scoreHRPick);
-    const { picks, message } = selectHRPicks(scored);
-    setMessage(message || `Source: /.netlify/functions/odds-mlb-hr • Candidates: ${candidates.length}`);
-
-    // 4) shape for UI
-    const picksUI = picks.map(p => ({
-      name: p.name, team: p.team, game: (p.away && p.home)? `${p.away}@${p.home}` : (p.gameId||''),
-      modelProb: p.p_blended, modelAmerican: p.modelAmerican,
-      oddsAmerican: p.oddsAmerican ?? null,
-      why2: p.why2, reasons: p.reasons
-    }));
-    setPicks(picksUI);
-  }catch(e){
-    console.error(e);
-    setMessage(String(e?.message||e));
-  }finally{
-    setLoading(false);
-  }
 }
