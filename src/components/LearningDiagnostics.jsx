@@ -1,0 +1,77 @@
+import React, { useEffect, useState } from "react";
+import { todayISO_ET } from "../utils/date.js";
+
+const COLOR = {
+  green: "bg-emerald-500",
+  yellow: "bg-amber-500",
+  red: "bg-rose-500",
+  gray: "bg-gray-300",
+};
+
+function Dot({ status }){
+  const cls = COLOR[status] || COLOR.gray;
+  return <span className={`inline-block w-2.5 h-2.5 rounded-full ${cls}`} />;
+}
+
+function Row({ data }){
+  const { label, status, picksToday, samples, daysLearned, lastRun, func } = data;
+  const funcTxt = func?.reachable ? "fn ok" : (func?.code ? `fn HTTP ${func.code}` : (func?.error ? "fn error" : "fn ?"));
+  return (
+    <div className="flex items-center justify-between gap-3 text-sm bg-white rounded px-3 py-2 shadow-sm border">
+      <div className="flex items-center gap-2">
+        <Dot status={status} />
+        <span className="font-medium">{label}</span>
+      </div>
+      <div className="text-xs text-gray-600 flex flex-wrap gap-x-4 gap-y-1">
+        <span>picks today: {picksToday ? "yes" : "no"}</span>
+        <span>samples: {samples}</span>
+        <span>days: {daysLearned}</span>
+        <span>last run: {lastRun ? new Date(lastRun).toLocaleString() : "—"}</span>
+        <span>{funcTxt}</span>
+      </div>
+    </div>
+  );
+}
+
+export default function LearningDiagnostics(){
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const date = todayISO_ET();
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try{
+        const r = await fetch(`/.netlify/functions/learn-diag?date=${encodeURIComponent(date)}`);
+        const j = await r.json();
+        if(!alive) return;
+        setData(j);
+      }catch(e){
+        if(!alive) return;
+        setError(String(e?.message || e));
+      }
+    })();
+    return () => { alive = false; };
+  }, [date]);
+
+  const order = ["mlb_hr","mlb_hits2","mlb_sb","nfl_td","soccer_ags"];
+  const models = data?.models || {};
+
+  return (
+    <div className="mt-4 p-3 border rounded bg-gray-50">
+      <div className="text-xs text-gray-600 mb-2">Learning diagnostics • {date} (ET)</div>
+      {error && <div className="text-xs text-rose-700">Error: {error}</div>}
+      <div className="grid grid-cols-1 md:grid-cols-1 gap-2">
+        {order.map(key => models[key] ? <Row key={key} data={models[key]} /> : (
+          <div key={key} className="flex items-center justify-between gap-3 text-sm bg-white rounded px-3 py-2 shadow-sm border opacity-60">
+            <div className="flex items-center gap-2">
+              <Dot status="gray" />
+              <span className="font-medium">{key}</span>
+            </div>
+            <div className="text-xs text-gray-600">not configured</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
