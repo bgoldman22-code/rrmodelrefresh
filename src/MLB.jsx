@@ -29,39 +29,6 @@ async function fetchHROddsIndex(){
   }catch{ return new Map(); }
 }
 
-function normalizeCandidates(raw){
-  const out = [];
-  if (!raw) return out;
-  const push = (obj) => {
-    if (!obj) return;
-    const name = obj.name || obj.player || obj.batter || "";
-    const team = obj.team || obj.teamAbbr || obj.team_abbr || obj.teamName || "";
-    const away = obj.away || obj.awayTeam || obj.away_team || "";
-    const home = obj.home || obj.homeTeam || obj.home_team || "";
-    const gameId = obj.gameId || obj.gamePk || obj.eventId || obj.event_id || obj.game || (away && home ? `${away}@${home}` : "");
-    out.push({
-      name, team,
-      away, home,
-      gameId,
-      oddsAmerican: obj.oddsAmerican ?? obj.odds_sim ?? null,
-      baseHRPA: obj.baseHRPA ?? obj.hr_base ?? obj.hr_prob_sim ?? null,
-      iso: obj.iso ?? obj.ISO ?? obj.seasonISO ?? obj.season_iso ?? null,
-      barrelRate: obj.barrelRate ?? obj.barrel_rate ?? obj.brls_pa ?? obj.barrels_per_pa ?? null,
-      recentHRperPA: obj.recentHRperPA ?? obj.hr_per_pa_l15 ?? obj.l15_hr_pa ?? null,
-      starterHR9: obj.starterHR9 ?? obj.pitcherHR9 ?? null,
-      venue: obj.venue || obj.park || obj.venueName || obj.venue_name || null,
-      platoonFlag: obj.platoonFlag ?? obj.platoon ?? null,
-      bvpPA: obj.bvpPA ?? obj.bvp_pa ?? 0,
-      bvpHR: obj.bvpHR ?? obj.bvp_hr ?? 0,
-      expPA: obj.expPA ?? obj.pa ?? 4
-    });
-  };
-  if (Array.isArray(raw)) raw.forEach(push);
-  else if (raw && typeof raw === 'object'){
-    if (Array.isArray(raw.candidates)) raw.candidates.forEach(push);
-    if (Array.isArray(raw.players)) raw.players.forEach(push);
-    if (Array.isArray(raw)) raw.forEach(push);
-  }
   return out;
 }
 
