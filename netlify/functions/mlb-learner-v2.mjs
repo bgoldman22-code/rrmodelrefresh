@@ -1,24 +1,19 @@
 /**
- * Safe MLB learner v2
- * - Defaults to yesterday (ET) unless ?date=YYYY-MM-DD provided
- * - Fetches MLB schedule, then each game's live feed
- * - Extracts HOME RUN plays, attributes batter/pitcher (ids, names), inning, team, and
- *   attempts to capture final pitch type + speed and approximate zone (if present)
- * - Aggregates into Netlify Blobs store "mlb-learning":
- *      - summary.json            → lastRun, days, samples (#HR events), daysList[]
- *      - hr/DATE.json            → array of HR events captured that day
- *      - profiles/batter/ID.json → cumulative per-batter stats
- *      - profiles/pitcher/ID.json→ cumulative per-pitcher stats
- * - Never returns 5xx. Any internal error returns { ok:false, error } with 200.
+ * MLB learner v2 — enhanced
+ * Adds:
+ *  - league/pitchTypes.json and league/zoneBuckets.json aggregates
+ *  - indexes/batters.json and indexes/pitchers.json (unique IDs + counts)
+ *  - summary.json now includes: batters, pitchers, leaguePitchSamples, leagueZoneSamples
+ *
+ * Safe: never 5xx. Errors returned with 200 and ok:false.
  */
 function fmtET(d=new Date()){
   return new Intl.DateTimeFormat("en-CA", { timeZone:"America/New_York", year:"numeric", month:"2-digit", day:"2-digit" }).format(d);
 }
 function yesterdayET(){
   const now = new Date();
-  // Shift to ET midnight
-  const etNowStr = fmtET(now);
-  const d = new Date(etNowStr+"T00:00:00Z"); // not exact ET, but date string is sufficient
+  const etStr = fmtET(now);
+  const d = new Date(etStr+"T00:00:00Z"); // we only care about the ET date string
   d.setUTCDate(d.getUTCDate()-1);
   return fmtET(d);
 }
@@ -27,7 +22,6 @@ async function getStoreSafe(name){
     const mod = await import("@netlify/blobs");
     if(mod?.getStore) return mod.getStore(name);
   }catch(_){}
-  // in-memory fallback
   const mem = new Map();
   return {
     async get(key, { type }={}){
@@ -46,33 +40,28 @@ async function fetchJSON(url, init){
   if(!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
   return r.json();
 }
+function get(obj, path, def=null){
+  try{ return path.split(".").reduce((a,k)=> (a && a[k]!==undefined) ? a[k] : undefined, obj) ?? def; }catch(_){ return def; }
+}
 function pickFinalPitch(play){
-  // Find last pitch event in playEvents
-  const evs = Array.isArray(play?.playEvents)? play.playEvents : [];
+  const evs = Array.isArray(play?.playEvents) ? play.playEvents : [];
   for(let i=evs.length-1;i>=0;i--){
     const ev = evs[i];
     if(ev?.isPitch || (ev?.details && ev?.details?.isPitch)) return ev;
   }
   return null;
 }
-function get(obj, path, def=null){
-  try{
-    return path.split(".").reduce((a,k)=> (a && a[k]!==undefined) ? a[k] : undefined, obj) ?? def;
-  }catch(_){ return def; }
+function zoneBucketOf(px, pz){
+  if(typeof px!=="number" || typeof pz!=="number") return "UNK";
+  const col = px < -0.4 ? "L" : (px > 0.4 ? "R" : "C");
+  const row = pz < 2.0 ? "Lo" : (pz > 3.5 ? "Hi" : "Md");
+  return row+col; // e.g., "MdC"
 }
 function addCount(map, key, by=1){
   if(!key) return;
   map[key] = (map[key]||0) + by;
 }
-function blankProfile(id, name){
-  return { id, name, days:0, samples:0, hr:0, vsPitchType:{}, zoneBucket:{}, lastUpdated:null };
-}
-function zoneBucketOf(px, pz){
-  if(typeof px!=="number" || typeof pz!=="number") return null;
-  const col = px < -0.4 ? "L" : (px > 0.4 ? "R" : "C");
-  const row = pz < 2.0 ? "Lo" : (pz > 3.5 ? "Hi" : "Md");
-  return row+col; // e.g., "MdC"
-}
+
 export default async (req) => {
   try{
     const url = new URL(req.url);
@@ -81,12 +70,20 @@ export default async (req) => {
     const store = await getStoreSafe("mlb-learning");
 
     if(dry){
-      return new Response(JSON.stringify({ ok:true, dry:true, date, note:"would scan schedule and HR plays" }), { headers:{ "content-type":"application/json" } });
+      return new Response(JSON.stringify({ ok:true, dry:true, date, note:"scan HR plays; update league + profiles" }), { headers:{ "content-type":"application/json" } });
     }
 
     // 1) Schedule
     const sched = await fetchJSON(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${encodeURIComponent(date)}`);
-    const games = (sched?.dates?.[0]?.games||[]).map(g => ({ id:g.gamePk, teams:g.teams }));
+    const games = (sched?.dates?.[0]?.games||[]).map(g => ({ id:g.gamePk }));
+
+    // Load aggregates
+    const leaguePitch = await store.get("league/pitchTypes.json", { type:"json" }) || { samples:0, hr:0, byType:{} };
+    const leagueZone  = await store.get("league/zoneBuckets.json", { type:"json" }) || { samples:0, hr:0, byBucket:{} };
+    const idxBat = await store.get("indexes/batters.json", { type:"json" }) || { ids:[], count:0 };
+    const idxPit = await store.get("indexes/pitchers.json", { type:"json" }) || { ids:[], count:0 };
+    const batSet = new Set(idxBat.ids||[]);
+    const pitSet = new Set(idxPit.ids||[]);
 
     const hrEvents = [];
     for(const g of games){
@@ -94,85 +91,78 @@ export default async (req) => {
         const feed = await fetchJSON(`https://statsapi.mlb.com/api/v1.1/game/${g.id}/feed/live`);
         const plays = get(feed, "liveData.plays.allPlays", []);
         for(const p of plays){
-          const type = get(p, "result.eventType", "");
-          if(type !== "home_run") continue;
+          if(get(p,"result.eventType","") !== "home_run") continue;
           const batterId = get(p, "matchup.batter.id", null);
           const batterName = get(p, "matchup.batter.fullName", get(p, "matchup.batter.name", "Unknown Batter"));
           const pitcherId = get(p, "matchup.pitcher.id", null);
           const pitcherName = get(p, "matchup.pitcher.fullName", get(p, "matchup.pitcher.name", "Unknown Pitcher"));
           const inning = get(p, "about.inning", null);
           const half = get(p, "about.halfInning", "");
-          const desc = get(p, "result.description", "");
-          const teamBat = get(p, "team.id", null) || get(p,"about.isTopInning", false) ? get(feed,"gameData.teams.away.id",null) : get(feed,"gameData.teams.home.id",null);
-          // Final pitch
           const pitch = pickFinalPitch(p);
-          const pitchType = get(pitch, "details.type.code", null);
-          const pitchName = get(pitch, "details.type.description", null);
-          const velo = get(pitch, "pitchData.startSpeed", null);
-          const px = get(pitch, "pitchData.coordinates.pX", null);
-          const pz = get(pitch, "pitchData.coordinates.pZ", null);
-          const zBucket = zoneBucketOf(px, pz);
+          const pitchType = get(pitch, "details.type.code", get(pitch,"details.type.description","UNK"));
+          const px = Number(get(pitch, "pitchData.coordinates.pX", NaN));
+          const pz = Number(get(pitch, "pitchData.coordinates.pZ", NaN));
+          const bucket = zoneBucketOf(px, pz);
 
-          hrEvents.push({
-            gamePk:g.id, inning, half,
-            batter:{ id:batterId, name:batterName },
-            pitcher:{ id:pitcherId, name:pitcherName },
-            pitch:{ type:pitchType, name:pitchName, velo },
-            zone: { px, pz, bucket:zBucket },
-            desc
-          });
+          // Save event
+          hrEvents.push({ gamePk:g.id, inning, half,
+                          batter:{ id:batterId, name:batterName },
+                          pitcher:{ id:pitcherId, name:pitcherName },
+                          pitch:{ type:pitchType }, zone:{ bucket } });
+
+          // Update league aggregates (per-HR)
+          leaguePitch.samples += 1; leaguePitch.hr += 1; addCount(leaguePitch.byType, String(pitchType||"UNK"), 1);
+          leagueZone.samples  += 1; leagueZone.hr  += 1; addCount(leagueZone.byBucket, String(bucket||"UNK"), 1);
+
+          // Update indexes
+          if(batterId!=null) batSet.add(batterId);
+          if(pitcherId!=null) pitSet.add(pitcherId);
+
+          // Update profiles (minimal)
+          if(batterId!=null){
+            const key = `profiles/batter/${batterId}.json`;
+            const prof = await store.get(key, { type:"json" }) || { id:batterId, name:batterName, samples:0, hr:0, vsPitchType:{}, zoneBucket:{}, lastUpdated:null };
+            prof.samples += 1; prof.hr += 1; addCount(prof.vsPitchType, String(pitchType||"UNK"), 1); addCount(prof.zoneBucket, String(bucket||"UNK"), 1);
+            prof.lastUpdated = new Date().toISOString();
+            await store.setJSON(key, prof);
+          }
+          if(pitcherId!=null){
+            const key = `profiles/pitcher/${pitcherId}.json`;
+            const prof = await store.get(key, { type:"json" }) || { id:pitcherId, name:pitcherName, samples:0, hr:0, vsPitchType:{}, zoneBucket:{}, lastUpdated:null };
+            prof.samples += 1; prof.hr += 1; addCount(prof.vsPitchType, String(pitchType||"UNK"), 1); addCount(prof.zoneBucket, String(bucket||"UNK"), 1);
+            prof.lastUpdated = new Date().toISOString();
+            await store.setJSON(key, prof);
+          }
         }
-      }catch(e){
-        // ignore this game's failures
-      }
+      }catch(_e){ /* ignore single game failures */ }
     }
 
-    // 2) Persist day HRs
+    // Persist day events
     await store.setJSON(`hr/${date}.json`, hrEvents);
 
-    // 3) Update profiles
-    const batterHit = new Map(); // id -> count in this day
-    const pitcherAllowed = new Map();
-    for(const ev of hrEvents){
-      if(ev?.batter?.id) batterHit.set(ev.batter.id, (batterHit.get(ev.batter.id)||0)+1);
-      if(ev?.pitcher?.id) pitcherAllowed.set(ev.pitcher.id, (pitcherAllowed.get(ev.pitcher.id)||0)+1);
-      // Update detailed profiles
-      // Batters
-      if(ev?.batter?.id){
-        const key = `profiles/batter/${ev.batter.id}.json`;
-        let prof = await store.get(key, { type:"json" }) || blankProfile(ev.batter.id, ev.batter.name);
-        prof.samples += 1;
-        prof.hr += 1;
-        addCount(prof.vsPitchType, ev?.pitch?.type || ev?.pitch?.name || "UNK", 1);
-        addCount(prof.zoneBucket, ev?.zone?.bucket || "UNK", 1);
-        prof.lastUpdated = new Date().toISOString();
-        await store.setJSON(key, prof);
-      }
-      // Pitchers
-      if(ev?.pitcher?.id){
-        const key = `profiles/pitcher/${ev.pitcher.id}.json`;
-        let prof = await store.get(key, { type:"json" }) || blankProfile(ev.pitcher.id, ev.pitcher.name);
-        prof.samples += 1;
-        prof.hr = (prof.hr||0) + 1; // hr allowed
-        addCount(prof.vsPitchType, ev?.pitch?.type || ev?.pitch?.name || "UNK", 1);
-        addCount(prof.zoneBucket, ev?.zone?.bucket || "UNK", 1);
-        prof.lastUpdated = new Date().toISOString();
-        await store.setJSON(key, prof);
-      }
-    }
+    // Persist league aggregates + indexes
+    idxBat.ids = Array.from(batSet); idxBat.count = idxBat.ids.length;
+    idxPit.ids = Array.from(pitSet); idxPit.count = idxPit.ids.length;
+    await store.setJSON("league/pitchTypes.json", leaguePitch);
+    await store.setJSON("league/zoneBuckets.json", leagueZone);
+    await store.setJSON("indexes/batters.json", idxBat);
+    await store.setJSON("indexes/pitchers.json", idxPit);
 
-    // 4) Update summary
+    // Update summary
     const summaryKey = "summary.json";
-    const prev = await store.get(summaryKey, { type:"json" }) || { daysList:[], samples:0 };
+    const prev = await store.get(summaryKey, { type:"json" }) || { daysList:[], samples:0, batters:0, pitchers:0, leaguePitchSamples:0, leagueZoneSamples:0 };
     const set = new Set(Array.isArray(prev.daysList) ? prev.daysList : []);
     set.add(date);
     const out = {
       ok: true,
       date,
-      games: games.length,
-      samples: (Number(prev.samples)||0) + hrEvents.length,
       days: set.size,
       daysList: Array.from(set),
+      samples: (Number(prev.samples)||0) + hrEvents.length,
+      batters: idxBat.count,
+      pitchers: idxPit.count,
+      leaguePitchSamples: leaguePitch.samples,
+      leagueZoneSamples: leagueZone.samples,
       lastRun: new Date().toISOString(),
       capturedHR: hrEvents.length
     };
