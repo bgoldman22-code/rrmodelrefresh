@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { americanFromProb, evFromProbAndOdds } from "./utils/ev.js";
 import { hotColdMultiplier } from "./utils/hotcold.js";
+import { scoreHRPick } from "./models/hr_scoring.js";
 
 const CAL_LAMBDA = 0.25;
 const HOTCOLD_CAP = 0.06;
