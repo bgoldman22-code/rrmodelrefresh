@@ -50,9 +50,9 @@ export default async (req) => {
     }),
     check("blobs_store", async () => {
       try{
-        const { getStore } = await import("@netlify/blobs");
-        const store = getStore("picks-log");
-        await store.get("health.json"); // may be null
+        const mod = await import("@netlify/blobs");
+        const store = mod.getStore("picks-log");
+        await store.get("health.json");
         return { status:"green", detail:"ok" };
       }catch(e){
         return { status:"red", detail:String(e?.message||e) };

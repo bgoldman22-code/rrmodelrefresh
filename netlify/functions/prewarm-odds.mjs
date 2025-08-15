@@ -10,17 +10,14 @@ export default async (req) => {
     if(dry) return new Response(JSON.stringify({ ok:true, dry:true, sports, markets, date }), { headers:{ "content-type":"application/json" }});
 
     if(!key){
-      // Return ok=false but 200 so diagnostics doesn't show a server error.
       return new Response(JSON.stringify({ ok:false, error:"missing-key", sports, markets, date }), { status:200, headers:{ "content-type":"application/json" }});
     }
 
-    // Optional: light ping to Odds API status (won't burn many credits)
+    // Light liveness ping
     try{
       const r = await fetch(`https://api.the-odds-api.com/v4/sports`, { headers:{ "x-api-key": key }});
-      // ignore response; just ensure network path is OK
-      // Do not treat non-200 as server failure
       await r.text().catch(()=>{});
-    }catch(_){ /* ignore */ }
+    }catch(_){}
 
     return new Response(JSON.stringify({ ok:true, status:"ok", sports, markets, date }), { headers:{ "content-type":"application/json" }});
   }catch(e){
