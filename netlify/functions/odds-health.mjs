@@ -23,15 +23,13 @@ const MARKETS = ["batter_home_runs","player_home_runs","player_to_hit_a_home_run
 export default async () => {
   const key = getKey();
   const envPresent = !!key;
-  const tried = [];
-  const summary = [];
-  const headersSeen = [];
   if(!envPresent){
     return ok({ ok:false, envPresent, message:"Missing OddsAPI key in env (set VITE_ODDS_API_KEY or ODDS_API_KEY)" });
   }
+  const summary = [];
+  const headersSeen = [];
   for(const m of MARKETS){
     const url = `${BASE}?regions=us,us2&oddsFormat=american&markets=${encodeURIComponent(m)}&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
-    tried.push({ market:m, url });
     try{
       const raw = await fetchRaw(url);
       headersSeen.push(raw.headers);
@@ -40,8 +38,7 @@ export default async () => {
         continue;
       }
       let data = [];
-      try{ data = JSON.parse(raw.text); }catch{}
-      // Count outcomes that look like "anytime HR"
+      try{ data = JSON.parse(raw.text); }catch{ summary.push({ market:m, ok:false, parseError:true }); continue; }
       let events = Array.isArray(data) ? data.length : 0;
       let parsed = 0, samples = [];
       for(const ev of (data||[])){
@@ -50,11 +47,11 @@ export default async () => {
           const markets = b?.markets||[];
           for(const mk of markets){
             if(mk?.key !== m) continue;
-            for(const o of (mk?.outcomes||[]){
+            for(const o of (mk?.outcomes||[])){
               const name = (o?.name||"").toLowerCase();
-              const point = Number(o?.point);
-              // Accept Over 0.5 OR "Yes" without point for the 'Yes to hit HR' variants
-              const isAnytime = (name === "over" && point === 0.5) || (name === "yes" && (!("point" in o) || isNaN(point)));
+              const point = (o?.point==null || Number.isNaN(Number(o?.point))) ? null : Number(o?.point);
+              // Accept Over 0.5 OR "Yes" without numeric point
+              const isAnytime = (name === "over" && point === 0.5) || (name === "yes" && point === null);
               if(!isAnytime) continue;
               parsed++;
               if(samples.length < 6){
@@ -66,7 +63,7 @@ export default async () => {
           }
         }
       }
-      summary.push({ market:m, ok:true, events, parsed, samples });
+      summary.push({ market:m, ok:true, events, parsed, sampleCount: samples.length, samples });
     }catch(e){
       summary.push({ market:m, ok:false, error: String(e?.message||e) });
     }

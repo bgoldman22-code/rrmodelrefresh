@@ -42,8 +42,8 @@ export default async () => {
             if(mk?.key !== m) continue;
             for(const o of (mk?.outcomes||[])){
               const name = (o?.name||"").toLowerCase();
-              const point = Number(o?.point);
-              const anytime = (name === "over" && point === 0.5) || (name === "yes" && (!("point" in o) || isNaN(point)));
+              const point = (o?.point==null || Number.isNaN(Number(o?.point))) ? null : Number(o?.point);
+              const anytime = (name === "over" && point === 0.5) || (name === "yes" && point === null);
               if(!anytime) continue;
               const player = getPlayerName(o);
               const american = getAmerican(o);
