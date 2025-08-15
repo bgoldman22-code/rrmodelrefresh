@@ -29,10 +29,6 @@ async function fetchHROddsIndex(){
   }catch{ return new Map(); }
 }
 
-  return out;
-}
-
-
 function americanToProb(odds){
   if (odds == null || isNaN(odds)) return null;
   const o = Number(odds);
