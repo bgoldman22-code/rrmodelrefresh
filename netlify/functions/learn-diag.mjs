@@ -2,9 +2,7 @@
  * learn-diag (dual shape, multi-model)
  * Returns BOTH:
  *   1) { ok, date, models: { mlb_hr: {...}, ... } }
- *   2) flattened legacy keys at top level: { mlb_hr: {...}, mlb_hits2: {...}, ... }
- * so any UI reading either shape will work.
- *
+ *   2) legacy top-level keys: { mlb_hr: {...}, mlb_hits2: {...}, ... }
  * Safe: never 5xx. If something is missing, returns sensible defaults.
  */
 import { getStore } from "@netlify/blobs";
@@ -83,6 +81,8 @@ export default async (req) => {
         item.samples     = Number(s.samples || s.totalSamples || 0);
         item.daysLearned = Number(s.days || s.uniqueDays || 0);
         item.lastRun     = s.lastRun || s.updatedAt || null;
+
+        // MLB HR extras
         if(M.key === "mlb_hr"){
           item.extras = {
             batters: Number(s.batters || 0),
@@ -119,7 +119,8 @@ export default async (req) => {
       };
     }
 
-    return ok({ ok:true, date, models, **legacy });
+    // Return both shapes so any UI version works
+    return ok({ ok:true, date, models, ...legacy });
   }catch(e){
     return ok({ ok:false, error:String(e?.message||e) });
   }
