@@ -1,35 +1,61 @@
-/** netlify/functions/odds-mlb-hr.mjs
- * OddsAPI → best price per player for MLB anytime HR using per-event endpoint.
- * Call: /.netlify/functions/odds-mlb-hr
- */
-function ok(data){ return new Response(JSON.stringify(data), { headers:{ "content-type":"application/json" }}); }
-function getKey(){ return process.env.VITE_ODDS_API_KEY || process.env.ODDS_API_KEY || process.env.ODDSAPI_KEY; }
+/** netlify/functions/odds-mlb-hr.mjs */
+
+function pad(n){ return String(n).padStart(2,'0'); }
+function isoNoMs(d){
+  const dt = new Date(d);
+  return dt.getUTCFullYear() + '-' +
+         pad(dt.getUTCMonth()+1) + '-' +
+         pad(dt.getUTCDate()) + 'T' +
+         pad(dt.getUTCHours()) + ':' +
+         pad(dt.getUTCMinutes()) + ':' +
+         pad(dt.getUTCSeconds()) + 'Z';
+}
+function startOfDayUTC(d){ const dt=new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),0,0,0)); }
+function endOfDayUTC(d){ const dt=new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),23,59,59)); }
+function ok(data){ return new Response(JSON.stringify(data, null, 2), { headers:{ "content-type":"application/json" }}); }
+function keyOdds(){ return process.env.VITE_ODDS_API_KEY || process.env.ODDS_API_KEY || process.env.ODDSAPI_KEY; }
 async function fetchJSON(url){
   const r = await fetch(url, { headers:{ "accept":"application/json" }});
+  const text = await r.text();
+  let json=null; try{ json=JSON.parse(text);}catch{}
+  return { ok:r.ok, status:r.status, json, text, url, headers:Object.fromEntries([...r.headers.entries()]) };
+}
+
+async function fetchJSONThrow(url){
+  const r = await fetch(url, { headers:{ "accept":"application/json" } });
   if(!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
-function iso(d){ return new Date(d).toISOString(); }
-function startOfDayUTC(d){ const dt=new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),0,0,0)); }
-function endOfDayUTC(d){ const dt=new Date(d); return new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),23,59,59)); }
-
 export default async () => {
-  const key = getKey();
+  const key = keyOdds();
   if(!key) return ok({ ok:false, error:"missing-api-key" });
-
-  const sport="baseball_mlb";
-  const base = `https://api.the-odds-api.com/v4/sports/${sport}`;
-  const now=new Date();
-  const from=startOfDayUTC(now), to=endOfDayUTC(now);
-  const eventsURL = `${base}/events?commenceTimeFrom=${encodeURIComponent(iso(from))}&commenceTimeTo=${encodeURIComponent(iso(to))}&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
-
-  let events=[]; try{ events=await fetchJSON(eventsURL);}catch(e){ return ok({ ok:false, stage:"events", error:String(e?.message||e) }); }
+  const sport = "baseball_mlb";
+  const base  = `https://api.the-odds-api.com/v4/sports/${sport}`;
+  const now = new Date();
+  const from = startOfDayUTC(now);
+  const to   = endOfDayUTC(now);
+  const q = new URLSearchParams({
+    commenceTimeFrom: isoNoMs(from),
+    commenceTimeTo: isoNoMs(to),
+    dateFormat: "iso",
+    apiKey: key
+  }).toString();
+  let events=[]; 
+  try{ events = await fetchJSONThrow(`${base}/events?${q}`); }
+  catch(e){ return ok({ ok:false, stage:"events", error:String(e?.message||e) }); }
   const best=new Map();
   for(const e of (Array.isArray(events)?events:[])){
     const id=e?.id; if(!id) continue;
-    let data; try{
-      const url = `${base}/events/${id}/odds?regions=us,us2&oddsFormat=american&markets=batter_home_runs&dateFormat=iso&apiKey=${encodeURIComponent(key)}`;
-      data = await fetchJSON(url);
+    let data; 
+    try{
+      const qs = new URLSearchParams({
+        regions:"us,us2",
+        oddsFormat:"american",
+        markets:"batter_home_runs",
+        dateFormat:"iso",
+        apiKey:key
+      }).toString();
+      data = await fetchJSONThrow(`${base}/events/${id}/odds?${qs}`);
     }catch{ continue; }
     for(const b of (data?.bookmakers||[])){
       for(const mk of (b?.markets||[])){
