@@ -1,9 +1,4 @@
 // src/models/hr_scoring.js
-// Context-aware HR probability + WHY + correct EV(1u) from odds.
-// Zero-edit drop-in: returns { prob_pp, model_odds, why, ev_1u }.
-// If your UI already uses scoreHRPick, this will immediately fix
-// unrealistic probabilities and EV mirroring probability.
-
 function clamp(x, lo, hi){ return Math.max(lo, Math.min(hi, x)); }
 
 function americanFromProb(p){
@@ -12,7 +7,6 @@ function americanFromProb(p){
   const am = dec >= 1 ? Math.round(dec * 100) : Math.round(-100 / dec);
   return (am > 0 ? "+" : "") + String(am);
 }
-
 function decimalFromAmerican(a){
   if (a == null || a === "-" ) return null;
   const s = String(a).trim();
@@ -20,24 +14,20 @@ function decimalFromAmerican(a){
   if (!isFinite(n) || n === 0) return null;
   return (n >= 100) ? (1 + n/100) : (1 + 100/Math.abs(n));
 }
-
 function ev1u(p, american){
   const dec = decimalFromAmerican(american);
   if (!dec) return null;
-  // EV for staking 1 unit: p*(dec-1) - (1-p)
   const ev = p*(dec-1) - (1-p);
-  return Math.round((ev + Number.EPSILON) * 1000) / 1000; // 3 dp
+  return Math.round((ev + Number.EPSILON) * 1000) / 1000;
 }
-
 function perGameFromHRPA(hr_pa, pas){
-  // Convert per-PA HR rate to per-game
   const pa = Math.max(1, Math.round(pas || 4));
   const q = clamp(1 - (hr_pa || 0.035), 0.0001, 0.9999);
   const p_game = 1 - Math.pow(q, pa);
   return clamp(p_game, 0.003, 0.40);
 }
 
-// --- Context multipliers (soft, capped) ---
+// multipliers
 function multFromPark(f){
   if (f == null || isNaN(f)) return 1.0;
   const adj = 0.5 + 0.5 * clamp(f, 0.7, 1.3);
@@ -46,7 +36,7 @@ function multFromPark(f){
 function multFromPitcherHR9(hr9){
   if (hr9 == null || isNaN(hr9)) return 1.0;
   const rel = hr9 / 1.2;
-  const m = 1 + clamp(rel - 1, -0.4, 0.4) * 0.6; // ±24% cap pre-clamp
+  const m = 1 + clamp(rel - 1, -0.4, 0.4) * 0.6;
   return clamp(m, 0.76, 1.24);
 }
 function multFromPlatoon(bats, throws){
@@ -110,8 +100,6 @@ function buildWhy(c){
   return [lead, tagLine, funLine].filter(Boolean).join(" ");
 }
 
-// Optional conservative shrink if your upstream skipped calibration.
-// This keeps top bats in a realistic 10–18% most days.
 function shrink(p){ return clamp(p * 0.65, 0.003, 0.40); }
 
 export function scoreHRPick(cand){
@@ -127,7 +115,7 @@ export function scoreHRPick(cand){
 
   const finalMult = clamp(park_mult * pitcher_mult * platoon_mult * barrel_mult * lineup_mult, 0.75, 1.25);
   const prob_raw = clamp(baseProb * finalMult, 0.003, 0.40);
-  const prob = shrink(prob_raw); // temporary realism clamp until full calibration restored
+  const prob = shrink(prob_raw);
 
   const model_odds = americanFromProb(prob);
 
@@ -150,13 +138,11 @@ export function scoreHRPick(cand){
     detail
   });
 
-  // If your pipeline injects live odds onto the candidate (cand.live_odds),
-  // compute EV right here so UI shows correct value without any extra code.
   const chosenOdds = (cand.live_odds ?? cand.model_odds ?? model_odds);
   const ev = ev1u(prob, chosenOdds);
 
   return {
-    prob_pp: Math.round(prob*1000)/10,  // percentage points with 0.1 precision
+    prob_pp: Math.round(prob*1000)/10,
     model_odds,
     why,
     ev_1u: ev
