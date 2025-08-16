@@ -1,29 +1,58 @@
 // src/MLB.jsx
 import React, { useEffect, useState } from "react";
 
-function todayISO(){
-  return new Date().toISOString().slice(0,10);
+function todayISO(){ return new Date().toISOString().slice(0,10); }
+
+async function tryFetchJSON(url){
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`${res.status} ${url}`);
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")){
+    const txt = await res.text();
+    throw new Error(`Non-JSON from ${url}: ${txt.slice(0,80)}`);
+  }
+  return res.json();
+}
+async function ensureLocked(date){
+  // Try to fetch; if missing (404 or HTML), trigger lock then retry once
+  try{
+    return await tryFetchJSON(`/picks/${date}.json`);
+  }catch(e){
+    // Kick the function to generate today's file (idempotent)
+    await fetch(`/.netlify/functions/lock_picks`, { method: "GET" }).catch(()=>{});
+    // small delay
+    await new Promise(r=> setTimeout(r, 800));
+    return await tryFetchJSON(`/picks/${date}.json`);
+  }
+}
+async function getOdds(date){
+  try{
+    return await tryFetchJSON(`/odds/${date}.json`);
+  }catch{
+    // Try to refresh once
+    await fetch(`/.netlify/functions/update_odds`).catch(()=>{});
+    await new Promise(r=> setTimeout(r, 500));
+    try{
+      return await tryFetchJSON(`/odds/${date}.json`);
+    }catch{
+      return {};
+    }
+  }
 }
 
 export default function MLB(){
   const [rows, setRows] = useState([]);
   const [meta, setMeta] = useState({ date: todayISO(), locked_at_et: null, model_version: null });
-  const [status, setStatus] = useState({ picks: 0, oddsSize: 0, merged: 0, error: null });
+  const [status, setStatus] = useState({ picks: 0, oddsSize: 0, merged: 0, error: null, refreshed:false });
 
   useEffect(()=>{
     let mounted = true;
     (async()=>{
       const date = todayISO();
       try{
-        const picksRes = await fetch(`/picks/${date}.json`);
-        if (!picksRes.ok){
-          setStatus(s=>({...s, error: `No locked picks yet for ${date}` }));
-          setRows([]);
-          return;
-        }
-        const picks = await picksRes.json();
-        const odds = await fetch(`/odds/${date}.json`).then(r=> r.ok ? r.json() : {}).catch(()=> ({}));
-        const merged = picks.picks.map(p => ({
+        const picks = await ensureLocked(date);
+        const odds = await getOdds(date);
+        const merged = (picks.picks||[]).map(p => ({
           player: p.player,
           team: p.team,
           game: `${p.opp}@${p.team}`,
@@ -35,7 +64,7 @@ export default function MLB(){
         if (!mounted) return;
         setMeta({ date: picks.date, locked_at_et: picks.locked_at_et, model_version: picks.model_version });
         setRows(merged);
-        setStatus({ picks: merged.length, oddsSize: Object.keys(odds).length, merged: merged.length, error: null });
+        setStatus({ picks: merged.length, oddsSize: Object.keys(odds).length, merged: merged.length, error: null, refreshed:true });
       }catch(e){
         if (!mounted) return;
         setStatus(s=>({...s, error: String(e?.message || e)}));
@@ -49,7 +78,7 @@ export default function MLB(){
       <h1 className="text-2xl font-bold">MLB — Home Run Picks</h1>
       <div className="text-sm opacity-80 mb-3">
         {meta.locked_at_et
-          ? <>Today’s picks locked at <b>{meta.locked_at_et} ET</b> — odds refresh live • Model <code>{meta.model_version}</code></>
+          ? <>Today’s picks locked at <b>{meta.locked_at_et} ET</b> — odds update live • Model <code>{meta.model_version}</code></>
           : <>Waiting for today’s locked list…</>}
       </div>
 
@@ -81,7 +110,7 @@ export default function MLB(){
       </table>
 
       <div className="mt-4 text-sm">
-        <b>Diagnostics:</b> Picks: {status.picks} • Live odds entries: {status.oddsSize}
+        <b>Diagnostics:</b> Picks: {status.picks} • Live odds entries: {status.oddsSize} {status.refreshed ? "• (auto-refreshed)" : ""}
         {status.error && <div className="text-red-600 mt-1">Error: {status.error}</div>}
       </div>
     </div>
