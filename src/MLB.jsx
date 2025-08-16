@@ -3,10 +3,10 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-multi-fallback";
+const MODEL_VERSION = "1.4.3-hotfix-picks-fallback-and-nav";
 
-// ---------- helpers ----------
 function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
+function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
 function americanFromProb(p){
   const x = clamp(Number(p)||0, 1e-6, 0.999999);
   if (x >= 0.5) return -Math.round(100 * x / (1-x));
@@ -20,15 +20,14 @@ function probFromAmerican(amer){
 }
 function clean(s){ return (s==null? "" : String(s).replace(/\s+/g,' ').trim()); }
 function stripDiacritics(s){ return (s||"").normalize('NFD').replace(/[\u0300-\u036f]/g,''); }
-function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
 function choose(n, k){
   if (k<0 || k>n) return 0;
   let r = 1;
   for (let i=1; i<=k; i++) r = (r*(n - (k-i)))/i;
   return Math.round(r);
 }
+function cleanName(name){ return String(name||"").replace(/[\u200B-\u200D\u2060]/g, ""); }
 
-// Normalize incoming candidates without mutating player names
 function normalizeCandidates(raw){
   const out = [];
   const push = (obj)=>{
@@ -76,8 +75,6 @@ function normalizeCandidates(raw){
 async function fetchPrimary(){
   try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
-
-// Build odds context; try several URLs in order and merge
 async function fetchOddsContext(){
   const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set(), tried: [] };
   const urls = [
@@ -131,24 +128,20 @@ async function fetchOddsContext(){
         }
       }
     }catch{/* keep trying next */}
-    if (byGamePlayer.size) break; // stop at first that yields data
+    if (byGamePlayer.size) break;
   }
   const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
   return { byGamePlayer, byPlayer, slateDate, games, tried };
 }
 
-// Fuzzy match for odds
 function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   const k1 = `${game}|${name}`.toLowerCase();
   if (byGamePlayer.has(k1)) return byGamePlayer.get(k1);
-
   const plain = stripDiacritics(String(name).toLowerCase().replace(/\./g,''));
   const parts = plain.split(/\s+/).filter(Boolean);
   const last = parts[parts.length-1] || "";
   const firstInit = (parts[0] || "").slice(0,1);
-
   if (byPlayer.has(plain)) return byPlayer.get(plain);
-
   let best = null;
   for (const [k,obj] of byPlayer.entries()){
     const p = stripDiacritics(k.replace(/\./g,'')).split(/\s+/);
@@ -160,7 +153,6 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   return best;
 }
 
-// Heuristic prob if model didn't supply one
 function heuristicProb(p){
   let prob = 0.035;
   if (p.iso != null) prob += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04);
@@ -171,6 +163,16 @@ function heuristicProb(p){
   return prob;
 }
 
+function gamesSeenFromCandidates(cands){
+  const set = new Set();
+  for (const c of cands){
+    const g = c.game || ((c.away && c.home) ? `${c.away}@${c.home}` : null);
+    if (g) set.add(g);
+    else if (c.eventId) set.add(String(c.eventId));
+  }
+  return set.size;
+}
+
 // ---------- component ----------
 export default function MLB(){
   const [rows, setRows] = useState([]);
@@ -178,19 +180,18 @@ export default function MLB(){
   const [loading, setLoading] = useState(false);
   const [diag, setDiag] = useState({
     source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null,
-    slateDate:null, rr2:0, rr3:0, unitMemo:"",
-    apiTried: [], logOk: null, learn: { bullpen_shadow: true, promoted: false }
+    slateDate:null, rr2:0, rr3:0, unitMemo:"", apiTried: [],
   });
 
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
     try{
-      const ctx = await fetchOddsContext(); // collect games/slate from the most permissive odds route
-
+      const ctx = await fetchOddsContext();
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
+
+      // If primary empty, build from odds endpoints
       if (!cands.length && ctx.byGamePlayer.size){
-        // Build candidates directly from odds when primary is empty
         const fromOdds = Array.from(ctx.byGamePlayer.values()).map(rec => {
           const [away,home] = (rec.game||"").split("@");
           return { name: rec.name, game: rec.game, home, away, team:"—", oddsAmerican: rec.price };
@@ -198,8 +199,9 @@ export default function MLB(){
         if (fromOdds.length){ cands = fromOdds; source = "odds-props (fallback via context)"; }
       }
       if (!cands.length){
-        setDiag(d => ({ ...d, source:"(no data)", count:0, games: ctx.games.size, slateDate: ctx.slateDate, apiTried: ctx.tried }));
-        throw new Error("No candidates (primary and fallback empty)");
+        setDiag(d => ({ ...d, source:"(no data)", count:0, games: ctx.games.size || 0, slateDate: ctx.slateDate, apiTried: ctx.tried }));
+        setMessage("No candidates (primary and fallback empty)");
+        return;
       }
 
       // Join live odds
@@ -212,69 +214,58 @@ export default function MLB(){
         return { ...c, oddsAmerican };
       });
 
-      // Score and pick
+      // Score and try the model's selector
       const scored = cands.map(scoreHRPick);
-      const { picks, message: chooseMsg } = selectHRPicks(scored);
-      setMessage(chooseMsg || "");
+      let selection = selectHRPicks(scored);
+      if (!selection || !Array.isArray(selection.picks)) selection = { picks: [], message: "" };
+      setMessage(selection.message || "");
 
-      const anchorsSet = new Set(["Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge","Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager","Marcell Ozuna","Kyle Tucker","Rafael Devers"]);
-      const anchors = picks.filter(p => anchorsSet.has(String(p.name))).length;
+      // Fallback: if selector returns 0, do a simple value-based pick so the table isn't empty
+      let picks = selection.picks;
+      if (!picks.length){
+        picks = scored.map((p) => {
+          let modelProb = (p.p_final ?? p.prob ?? p.p ?? null);
+          if (modelProb == null) modelProb = heuristicProb(p);
+          const modelAmerican = modelProb != null ? americanFromProb(modelProb) : null;
+          const liveAmerican = Number.isFinite(p.oddsAmerican) ? Math.round(p.oddsAmerican) : null;
+          let edge = null;
+          if (modelProb != null && liveAmerican != null){
+            const liveP = probFromAmerican(liveAmerican);
+            if (liveP != null){ edge = (modelProb - liveP); }
+          }
+          return { ...p, modelProb, modelAmerican, liveAmerican, edge };
+        });
+        // keep ones with odds or decent prob
+        picks = picks.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
+        // sort by edge then prob
+        picks.sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
+        picks = picks.slice(0, 12);
+      }
 
-      const enriched = picks.map((p) => {
-        let modelProb = (p.p_final ?? p.prob ?? p.p ?? null);
-        if (modelProb == null) modelProb = heuristicProb(p);
-        const modelAmerican = modelProb != null ? americanFromProb(modelProb) : null;
-        const liveAmerican = Number.isFinite(p.oddsAmerican) ? Math.round(p.oddsAmerican) : null;
-        let edge = null;
-        if (modelProb != null && liveAmerican != null){
-          const liveP = probFromAmerican(liveAmerican);
-          if (liveP != null){ edge = (modelProb - liveP); }
-        }
-        let unit = "1x";
-        if (edge != null){
-          if (edge >= 0.04 || (anchorsSet.has(p.name) && modelProb >= 0.12)) unit = "3x";
-          else if (edge >= 0.02) unit = "2x";
-        } else if (anchorsSet.has(p.name) && modelProb && modelProb >= 0.12) {
-          unit = "2x";
-        }
-        return { ...p, modelProb, modelAmerican, liveAmerican, edge, unit };
-      });
-
-      // Filter late-junk: requires odds or >=6%
-      const filtered = enriched.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
-      const sorted = filtered.slice().sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
-      const topN = sorted.slice(0, 12);
-
-      const rr2 = choose(topN.length, 2);
-      const rr3 = choose(topN.length, 3);
-      const unitMemo = (()=>{
-        const c3 = topN.filter(x=>x.unit==="3x").length;
-        const c2 = topN.filter(x=>x.unit==="2x").length;
-        const c1 = topN.filter(x=>x.unit==="1x").length;
-        return `${c3}×3u, ${c2}×2u, ${c1}×1u across ${topN.length} legs`;
-      })();
-
-      const probs = topN.map(p => p.modelProb).filter(x => Number.isFinite(x));
+      // Build rows
+      const probs = picks.map(p => p.modelProb ?? (p.p_final ?? p.prob ?? p.p ?? null)).filter(x => Number.isFinite(x));
       const avgProb = probs.length ? (100*probs.reduce((a,b)=>a+b,0)/probs.length) : null;
-      const liveOddsCount = topN.filter(p => Number.isFinite(p.liveAmerican)).length;
-      const liveOddsPct = topN.length ? Math.round(100 * liveOddsCount / topN.length) : 0;
+      const liveOddsCount = picks.filter(p => Number.isFinite(p.oddsAmerican)).length;
+      const liveOddsPct = picks.length ? Math.round(100 * liveOddsCount / picks.length) : 0;
 
-      setDiag(d => ({ ...d, source, count: cands.length, games: ctx.games.size, picks: topN.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, apiTried: ctx.tried }));
+      const rr2 = choose(picks.length, 2);
+      const rr3 = choose(picks.length, 3);
+      const unitMemo = `${picks.length ? "Balance across anchors and values" : ""}`;
 
-      const ui = topN.map((p) => ({
-        name: String(p.name||"").replace(/[\u200B-\u200D\u2060]/g, ""),
+      const gamesSeen = ctx.games.size || gamesSeenFromCandidates(cands);
+
+      setDiag(d => ({ ...d, source, count: cands.length, games: gamesSeen, picks: picks.length, anchors: 0, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, apiTried: ctx.tried }));
+
+      const ui = picks.map((p) => ({
+        name: cleanName(p.name||""),
         team: p.team||"—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
-        modelProb: p.modelProb ?? null,
-        modelAmerican: p.modelAmerican ?? (p.modelProb ? americanFromProb(p.modelProb) : null),
-        oddsAmerican: p.liveAmerican ?? null,
+        modelProb: p.modelProb ?? (p.p_final ?? p.prob ?? p.p ?? null),
+        modelAmerican: (p.modelProb != null ? americanFromProb(p.modelProb) : (p.p_final ?? p.prob ?? p.p ? americanFromProb(p.p_final ?? p.prob ?? p.p) : null)),
+        oddsAmerican: p.liveAmerican ?? p.oddsAmerican ?? null,
         why: buildWhy(p),
-        unit: p.unit
       }));
       setRows(ui);
-
-      // No logging here to keep the repro simple while we stabilize feeds
-
     }catch(e){
       setMessage(String(e?.message||e));
       console.error(e);
@@ -285,44 +276,35 @@ export default function MLB(){
 
   useEffect(()=>{ generate(); }, []);
 
-  // WHY text: varied and human
   function buildWhy(p){
     const facts = [];
     if (p.oppThrows && p.bats){ facts.push(`${p.bats.toUpperCase()} vs ${p.oppThrows.toUpperCase()} match-up`); }
     else if (p.oppThrows){ facts.push(`faces a ${p.oppThrows.toUpperCase()}HP`); }
     if (p.iso != null){
       const iso = Number(p.iso);
-      if (iso >= 0.220) facts.push(`extra-base profile (ISO ${iso.toFixed(3)})`);
-      else if (iso >= 0.180) facts.push(`solid pop (ISO ${iso.toFixed(3)})`);
+      if (iso >= 0.240) facts.push(`big pop (ISO ${iso.toFixed(3)})`);
+      else if (iso >= 0.190) facts.push(`solid pop (ISO ${iso.toFixed(3)})`);
     }
     if (p.barrelRate != null){
       const br = Number(p.barrelRate)*100;
-      if (br >= 10) facts.push(`barrels ${br.toFixed(1)}%`);
-    }
-    if (p.fbPct != null && p.pullPct != null){
-      const fb = Number(p.fbPct)*100, pl = Number(p.pullPct)*100;
-      if (fb >= 35 && pl >= 40) facts.push(`air + pull combo (${fb.toFixed(0)}% FB, ${pl.toFixed(0)}% pull)`);
+      if (br >= 12) facts.push(`barrels ${br.toFixed(1)}%`);
     }
     if (p.recentHRperPA != null){
       const r = Number(p.recentHRperPA)*100;
-      if (r >= 2.0) facts.push(`L15 HR/PA ${r.toFixed(1)}%`);
+      if (r >= 1.5) facts.push(`L15 HR/PA ${r.toFixed(1)}%`);
     }
     if (p.starterHR9 != null){
       const s = Number(p.starterHR9);
-      if (s >= 1.3) facts.push(`opponent allows ${s.toFixed(2)} HR/9`);
-    }
-    if (p.bvpPA != null && p.bvpPA >= 8 && p.bvpHR >= 1){
-      facts.push(`BvP: ${p.bvpHR} HR in ${p.bvpPA} PA`);
+      if (s >= 1.3) facts.push(`opp allows ${s.toFixed(2)} HR/9`);
     }
     if (p.expPA != null) facts.push(`~${p.expPA} PAs`);
 
-    const head = String(p.name||"").replace(/[\u200B-\u200D\u2060]/g, "");
+    const head = cleanName(p.name||"");
     const ctx = p.game ? ` (${p.game})` : "";
     if (!facts.length) return `${head}${ctx} — trending power spot.`;
     return `${head}${ctx} — ${facts.slice(0,4).join(" • ")}`;
   }
 
-  // Simple pill
   function Chip({ok, children}){
     return <span className={ok ? "inline-block px-2 py-0.5 rounded bg-green-100 text-green-800" : "inline-block px-2 py-0.5 rounded bg-red-100 text-red-800"}>{children}</span>;
   }
@@ -359,7 +341,6 @@ export default function MLB(){
                 <th className="px-4 py-2 text-left">Model Odds</th>
                 <th className="px-4 py-2 text-left">Live Odds</th>
                 <th className="px-4 py-2 text-left">Why</th>
-                <th className="px-4 py-2 text-left">Units</th>
               </tr>
             </thead>
             <tbody>
@@ -372,7 +353,6 @@ export default function MLB(){
                   <td className="px-4 py-2">{p.modelAmerican != null ? fmtAmerican(p.modelAmerican) : "—"}</td>
                   <td className="px-4 py-2">{p.oddsAmerican != null ? fmtAmerican(p.oddsAmerican) : "—"}</td>
                   <td className="px-4 py-2 text-sm">{p.why}</td>
-                  <td className="px-4 py-2">{p.unit || "—"}</td>
                 </tr>
               ))}
             </tbody>
@@ -382,7 +362,6 @@ export default function MLB(){
         <div className="text-gray-500">No picks yet.</div>
       )}
 
-      {/* Footer: diagnostics + RR + which endpoints tried */}
       <div className="mt-6 text-sm text-gray-700 space-y-2">
         <div className="flex flex-wrap gap-2">
           <Chip ok={diag.picks>=8}>Picks: {diag.picks}</Chip>
@@ -394,7 +373,7 @@ export default function MLB(){
         <div><strong>Odds endpoints tried:</strong> {diag.apiTried.join(" → ") || "—"}</div>
         <div className="flex flex-wrap gap-2">
           <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
-          <Chip ok={true}>Features: multi-fallback • fuzzy_match • rr_units</Chip>
+          <Chip ok={true}>Features: picks-fallback • multi-fallback • fuzzy_match</Chip>
         </div>
       </div>
     </div>
