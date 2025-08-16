@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
+// ---------- helpers ----------
 function americanFromProb(p){
   const x = Math.max(1e-6, Math.min(0.999999, Number(p)||0));
   if (x >= 0.5) return -Math.round(100 * x / (1-x));
@@ -23,7 +24,7 @@ function uniqGames(cands){
 // DO NOT transform names; only trim whitespace
 function normalizeCandidates(raw){
   const out = [];
-  const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
+  const clean = (s)=> (s==null? "" : String(s).replace(/\\s+/g,' ').trim());
   const push = (obj)=>{
     if (!obj) return;
     const name = clean(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
@@ -75,7 +76,7 @@ async function fetchFallback(){
     if(!r.ok) return [];
     const data = await r.json();
     const out = [];
-    const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
+    const clean = (s)=> (s==null? "" : String(s).replace(/\\s+/g,' ').trim());
     for (const ev of (data?.events||[])){
       const home = ev.home_team || ev.homeTeam || "";
       const away = ev.away_team || ev.awayTeam || "";
@@ -103,7 +104,7 @@ async function fetchHROddsIndex(){
     if(!r.ok) return new Map();
     const data = await r.json();
     const map = new Map();
-    const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
+    const clean = (s)=> (s==null? "" : String(s).replace(/\\s+/g,' ').trim());
     if(Array.isArray(data?.events)){
       for (const ev of data.events){
         const gameCode = (ev?.home_team && ev?.away_team) ? `${clean(ev.away_team)}@${clean(ev.home_team)}` : (ev?.id || ev?.commence_time || "");
@@ -124,11 +125,12 @@ async function fetchHROddsIndex(){
   }catch{ return new Map(); }
 }
 
+// ---------- component ----------
 export default function MLB(){
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
-  const [diag, setDiag] = useState({ source:"—", count:0, games:0 });
+  const [diag, setDiag] = useState({ source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null });
 
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
@@ -152,11 +154,20 @@ export default function MLB(){
 
       const scored = cands.map(scoreHRPick);
       const { picks, message: chooseMsg } = selectHRPicks(scored);
-      setDiag({ source, count: cands.length, games: uniqGames(cands) });
       setMessage(chooseMsg || "");
 
+      // Stats for footer
+      const anchorsSet = new Set(["Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge","Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager","Marcell Ozuna","Kyle Tucker","Rafael Devers"]);
+      const anchors = picks.filter(p => anchorsSet.has(String(p.name))).length;
+      const probs = picks.map(p => p.p_final).filter(Number.isFinite);
+      const avgProb = probs.length ? (100*probs.reduce((a,b)=>a+b,0)/probs.length) : null;
+      const liveOddsCount = picks.filter(p => Number.isFinite(p.oddsAmerican)).length;
+      const liveOddsPct = picks.length ? Math.round(100 * liveOddsCount / picks.length) : 0;
+
+      setDiag({ source, count: cands.length, games: uniqGames(cands), picks: picks.length, anchors, avgProb, liveOddsPct });
+
       const ui = picks.map((p) => {
-        // protect first letter from any ::first-letter CSS rules that might hide it
+        // protect first letter (handles accidental ::first-letter CSS)
         const safeName = "\\u2060" + String(p.name||"");
         return {
           name: safeName,
@@ -170,6 +181,7 @@ export default function MLB(){
       });
       setRows(ui);
 
+      // fire-and-forget daily log
       (async ()=>{
         try{
           const payload = {
@@ -206,49 +218,62 @@ export default function MLB(){
   useEffect(()=>{ generate(); }, []);
 
   return (
-    <div>
-      <h1>MLB — Home Run Picks</h1>
-      <p>Source: {diag.source} • Candidates: {diag.count} • Games seen: {diag.games}</p>
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-2">MLB — Home Run Picks</h1>
+      <p className="text-sm text-gray-600 mb-4">
+        Source: {diag.source} • Candidates: {diag.count} • Games seen: {diag.games}
+      </p>
 
-      <div>
-        <button onClick={generate} disabled={loading}>
+      <div className="flex items-center gap-3 mb-4">
+        <button
+          className="px-4 py-2 bg-blue-600 text-white rounded-md shadow hover:bg-blue-700 disabled:opacity-60"
+          onClick={generate}
+          disabled={loading}
+        >
           {loading ? "Generating…" : "Generate"}
         </button>
-        {message ? <span> {message}</span> : null}
+        {message ? <span className="text-sm text-gray-700">{message}</span> : null}
       </div>
 
       {rows.length ? (
-        <div style={{overflowX:'auto'}}>
-          <table>
-            <thead>
+        <div className="overflow-x-auto">
+          <table className="min-w-full border">
+            <thead className="bg-gray-100">
               <tr>
-                <th>Player</th>
-                <th>Team</th>
-                <th>Game</th>
-                <th>Model HR Prob</th>
-                <th>Model Odds</th>
-                <th>Live Odds</th>
-                <th>Why</th>
+                <th className="px-4 py-2 text-left">Player</th>
+                <th className="px-4 py-2 text-left">Team</th>
+                <th className="px-4 py-2 text-left">Game</th>
+                <th className="px-4 py-2 text-left">Model HR Prob</th>
+                <th className="px-4 py-2 text-left">Model Odds</th>
+                <th className="px-4 py-2 text-left">Live Odds</th>
+                <th className="px-4 py-2 text-left">Why</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((p, idx) => (
-                <tr key={idx}>
-                  <td>{p.name}</td>
-                  <td>{p.team}</td>
-                  <td>{p.game}</td>
-                  <td>{p.modelProb != null ? (p.modelProb*100).toFixed(1) + "%" : "—"}</td>
-                  <td>{p.modelAmerican != null ? (p.modelAmerican>0?`+${p.modelAmerican}`:p.modelAmerican) : "—"}</td>
-                  <td>{p.oddsAmerican != null ? (p.oddsAmerican>0?`+${p.oddsAmerican}`:p.oddsAmerican) : "—"}</td>
-                  <td>{p.why}</td>
+                <tr key={idx} className="border-t align-top">
+                  <td className="px-4 py-2">{p.name}</td>
+                  <td className="px-4 py-2">{p.team}</td>
+                  <td className="px-4 py-2">{p.game}</td>
+                  <td className="px-4 py-2">{p.modelProb != null ? (p.modelProb*100).toFixed(1) + "%" : "—"}</td>
+                  <td className="px-4 py-2">{p.modelAmerican != null ? (p.modelAmerican>0?`+${p.modelAmerican}`:p.modelAmerican) : "—"}</td>
+                  <td className="px-4 py-2">{p.oddsAmerican != null ? (p.oddsAmerican>0?`+${p.oddsAmerican}`:p.oddsAmerican) : "—"}</td>
+                  <td className="px-4 py-2 text-sm">{p.why}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       ) : (
-        <div>No picks yet.</div>
+        <div className="text-gray-500">No picks yet.</div>
       )}
+
+      {/* Footer diagnostics (restored) */}
+      <div className="mt-6 text-sm text-gray-700 space-y-1">
+        <div><strong>Diagnostics:</strong></div>
+        <div>• Picks shown: {diag.picks} (anchors: {diag.anchors})</div>
+        <div>• Avg model prob: {diag.avgProb != null ? diag.avgProb.toFixed(1)+'%' : '—'}, Live odds coverage: {diag.liveOddsPct != null ? diag.liveOddsPct+'%' : '—'}</div>
+      </div>
     </div>
   );
 }
