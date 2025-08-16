@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-odds-diagnostics";
+const MODEL_VERSION = "1.4.3-hotfix-odds-diagnostics-v2";
 
 function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
 function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
@@ -27,6 +27,7 @@ function choose(n, k){
   return Math.round(r);
 }
 
+// ---------- Candidate normalization (safe to call on unknown shapes) ----------
 function normalizeCandidates(raw){
   const out = [];
   const push = (obj)=>{
@@ -71,51 +72,50 @@ function normalizeCandidates(raw){
   return out;
 }
 
-async function fetchPrimary(){
-  try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
+// ---------- Odds context (improved diagnostics + nested shapes) ----------
+function *yieldEventsLike(data){
+  if (!data) return;
+  if (Array.isArray(data)) { for (const x of data) yield x; return; }
+  if (Array.isArray(data.events)) { for (const x of data.events) yield x; }
+  if (data.data){ yield* yieldEventsLike(data.data); }
+  if (Array.isArray(data.response)) { for (const x of data.response) yield x; }
 }
+
 async function fetchOddsContext(){
   const urls = [
     "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
     "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
+    // widen markets one-by-one
+    "/.netlify/functions/odds-props?league=mlb&markets=player_to_hit_a_home_run&regions=us",
+    "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_to_hit_a_home_run&regions=us",
+    // widen regions
+    "/.netlify/functions/odds-props?league=mlb&markets=player_to_hit_a_home_run&regions=us,us2",
+    "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_to_hit_a_home_run&regions=us,us2",
+    // last resort: any props with us region
     "/.netlify/functions/odds-props?league=mlb&regions=us",
     "/.netlify/functions/odds-props?sport=baseball_mlb&regions=us"
   ];
+
   const byGamePlayer = new Map();
   const byPlayer = new Map();
   const games = new Set();
   let earliest = null;
   const tried = [];
-  const rawSnapshots = []; // for diagnostics
+  const rawSnapshots = []; // diagnostics
 
   for (const url of urls){
     tried.push(url);
     try{
       const r = await fetch(url);
-      if (!r.ok) continue;
-      const data = await r.json();
-      // Keep a compact snapshot (first 10 outcomes) for diagnostics
-      const snap = [];
-      for (const ev of (data?.events||[])){
-        const evSnap = { id: ev.id, home: ev.home_team||ev.homeTeam, away: ev.away_team||ev.awayTeam, markets: 0, sample: [] };
-        for (const bk of (ev.bookmakers||[])){
-          for (const mk of (bk.markets||[])){
-            const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
-            const texty = (mk.key_name || mk.market || mk.key || "").toLowerCase();
-            const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run") || texty.includes("home run");
-            if (!isHR) continue;
-            evSnap.markets++;
-            for (const oc of (mk.outcomes||[])){
-              if (evSnap.sample.length >= 10) break;
-              evSnap.sample.push({
-                name: oc.name || oc.description || oc.participant || "",
-                price: oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds
-              });
-            }
-          }
-        }
-        if (evSnap.sample.length) snap.push(evSnap);
-        // also build our join maps
+      const status = r.status;
+      const text = await r.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* not JSON */ }
+      const sample = [];
+      let evtCount = 0;
+
+      for (const ev of yieldEventsLike(data)){
+        evtCount++;
         const home = ev.home_team || ev.homeTeam || "";
         const away = ev.away_team || ev.awayTeam || "";
         const game = away && home ? `${clean(away)}@${clean(home)}` : (ev.id || "");
@@ -127,36 +127,50 @@ async function fetchOddsContext(){
             if (earliest==null || dt < earliest) earliest = dt;
           }
         }
-        for (const bk of (ev.bookmakers||[])){
-          for (const mk of (bk.markets||[])){
+        // markets
+        const bks = ev.bookmakers || ev.books || [];
+        for (const bk of bks){
+          const mks = bk.markets || bk.props || [];
+          for (const mk of mks){
             const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
             const texty = (mk.key_name || mk.market || mk.key || "").toLowerCase();
             const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run") || texty.includes("home run");
             if (!isHR) continue;
-            for (const oc of (mk.outcomes||[])){
-              const player = clean(oc.name || oc.description || oc.participant || "");
-              let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
-              if (!player || !Number.isFinite(price) || price === 0) continue;
-              const k1 = `${game}|${player}`.toLowerCase();
-              if (!byGamePlayer.has(k1) || Math.abs(price) < Math.abs(byGamePlayer.get(k1).price)){
-                byGamePlayer.set(k1, { price, game, name: player });
-              }
-              const k2 = player.toLowerCase();
-              if (!byPlayer.has(k2) || Math.abs(price) < Math.abs(byPlayer.get(k2).price)){
-                byPlayer.set(k2, { price, game, name: player });
+            const outs = mk.outcomes || mk.outcomes_list || mk.selections || [];
+            for (const oc of outs){
+              const nm = clean(oc.name || oc.description || oc.participant || oc.player || "");
+              let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds ?? oc.line);
+              if (nm && Number.isFinite(price) && price !== 0){
+                const k1 = `${game}|${nm}`.toLowerCase();
+                if (!byGamePlayer.has(k1) || Math.abs(price) < Math.abs(byGamePlayer.get(k1).price)){
+                  byGamePlayer.set(k1, { price, game, name: nm });
+                }
+                const k2 = nm.toLowerCase();
+                if (!byPlayer.has(k2) || Math.abs(price) < Math.abs(byPlayer.get(k2).price)){
+                  byPlayer.set(k2, { price, game, name: nm });
+                }
+                if (sample.length < 10) sample.push({ name: nm, price });
               }
             }
           }
         }
       }
-      rawSnapshots.push({ url, sample: snap.slice(0, 5) });
-    }catch{/* continue */}
+
+      rawSnapshots.push({
+        url, status, bytes: text.length, events: evtCount, sample
+      });
+
+    }catch(e){
+      rawSnapshots.push({ url, error: String(e) });
+    }
     if (byGamePlayer.size) break;
   }
+
   const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
   return { byGamePlayer, byPlayer, slateDate, games, tried, rawSnapshots };
 }
 
+// ---------- Fuzzy join ----------
 function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   const k1 = `${game}|${name}`.toLowerCase();
   if (byGamePlayer.has(k1)) return byGamePlayer.get(k1);
@@ -176,6 +190,7 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   return best;
 }
 
+// ---------- Light features to avoid uniform 3.5% ----------
 function featureBumps(p){
   let bump = 0.0;
   if (p.iso != null) bump += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04);
@@ -212,6 +227,7 @@ function gamesSeenFromCandidates(cands){
   return set.size;
 }
 
+// ---------- Main component ----------
 export default function MLB(){
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
@@ -221,7 +237,16 @@ export default function MLB(){
     slateDate:null, rr2:0, rr3:0, unitMemo:"", apiTried: [], lateBanner:false
   });
   const [debugOpen, setDebugOpen] = useState(false);
-  const [rawOdds, setRawOdds] = useState([]); // diagnostics snapshots
+  const [rawOdds, setRawOdds] = useState([]); // diagnostics
+
+  async function fetchPrimary(){
+    try{
+      const r = await fetch('/.netlify/functions/odds-mlb-hr');
+      if(!r.ok) return [];
+      const json = await r.json();
+      return normalizeCandidates(json);
+    }catch{ return []; }
+  }
 
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
@@ -409,7 +434,7 @@ export default function MLB(){
 
       {debugOpen && (
         <div className="mt-6 p-4 bg-gray-900 text-gray-100 rounded">
-          <div className="font-semibold mb-2">Raw odds (first few per endpoint)</div>
+          <div className="font-semibold mb-2">Raw odds (first few & meta)</div>
           {rawOdds.length === 0 ? (
             <div className="text-sm opacity-80">No odds snapshots captured.</div>
           ) : (
@@ -417,6 +442,7 @@ export default function MLB(){
               {rawOdds.map((blk, i)=>(
                 <div key={i}>
                   <div className="mb-1 underline break-all">{blk.url}</div>
+                  <div className="mb-1 opacity-80">status {blk.status ?? '—'} • bytes {blk.bytes ?? '—'} • events {blk.events ?? '—'} {blk.error ? `• error ${blk.error}` : ""}</div>
                   <pre className="whitespace-pre-wrap">{JSON.stringify(blk.sample, null, 2)}</pre>
                 </div>
               ))}
