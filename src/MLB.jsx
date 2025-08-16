@@ -1,8 +1,8 @@
-// src/MLB.jsx  (with fallback pre-wired)
+// src/MLB.jsx (wired to hardened fallback)
 import React, { useEffect, useState } from "react";
 import { selectHRPicks } from "./models/hr_select.js";
 import { scoreHRPick } from "./models/hr_scoring.js";
-import { buildCandidatesFromOddsProps } from "./lib/common/odds_fallback.js";
+import { buildCandidatesFromOddsPropsHardened } from "./lib/common/odds_fallback.js";
 
 function americanToProb(odds){
   if (odds == null || isNaN(odds)) return null;
@@ -38,7 +38,6 @@ function normalizeCandidates(raw){
       game, eventId,
       oddsAmerican: (odds != null ? Number(odds) : null),
       impliedProb,
-      // modeling features (accept many aliases)
       baseHRPA: obj.baseHRPA ?? obj.hr_base ?? obj.hr_prob_sim ?? null,
       expPA: obj.expPA ?? obj.pa ?? 4,
       venue: obj.venue || obj.park || obj.venueName || obj.venue_name || null,
@@ -116,17 +115,21 @@ export default function MLB(){
     try{
       // 1) Primary: get candidates from your Netlify function
       const baseRes = await fetch('/.netlify/functions/odds-mlb-hr');
-      if(!baseRes.ok) throw new Error(`odds-mlb-hr HTTP ${baseRes.status}`);
-      const baseJson = await baseRes.json();
+      // if HTTP error, don't throw yet — we still want fallback
+      const baseJson = baseRes.ok ? await baseRes.json() : null;
       let cands = normalizeCandidates(baseJson);
       let dataSource = '/.netlify/functions/odds-mlb-hr';
 
-      // 1b) Fallback: if zero, build from odds-props
+      // 1b) Fallback: if zero, build from odds-props (hardened)
       if (!cands.length) {
-        const fb = await buildCandidatesFromOddsProps();
-        if (fb.length) { cands = fb; dataSource = '/.netlify/functions/odds-props (fallback)'; }
+        const fb = await buildCandidatesFromOddsPropsHardened();
+        if (fb.candidates?.length) {
+          cands = fb.candidates;
+          dataSource = `odds-props fallback (${fb.sourceTried||"no-source"})`;
+          console.info("Fallback diagnostics:", fb);
+        }
       }
-      if (!cands.length) throw new Error('No candidates returned (primary and fallback both empty)');
+      if (!cands.length) throw new Error('No candidates (primary empty and fallback parsed 0 from all URLs).');
 
       // 2) Join live HR odds (best seen)
       const idx = await fetchHROddsIndex();
