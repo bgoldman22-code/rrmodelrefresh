@@ -1,28 +1,18 @@
-// src/lib/common/name_map.js
-// Robust player-name normalizer so odds joins and anchor detection don't miss stars.
-
+\
+/* src/lib/common/name_map.js */
 function stripDiacritics(s){
-  try{
-    return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  }catch{ return s; }
+  try{ return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }catch{ return s; }
 }
-
 export function normalizePlayerName(raw){
   if (!raw) return "";
   let s = String(raw);
-  s = stripDiacritics(s);
-  s = s.replace(/\./g, '');           // remove periods
-  s = s.replace(/\s+/g, ' ').trim();  // collapse spaces
-  // If name is "Last, First" -> "First Last"
+  s = stripDiacritics(s).replace(/\./g,'').replace(/\s+/g,' ').trim();
   if (s.includes(',')){
     const [last, first] = s.split(',').map(x=>x.trim());
     if (first && last) s = `${first} ${last}`;
   }
-  // Common nick/suffix cleanup
   s = s.replace(/\bJr\b\.?/i,'').replace(/\bSr\b\.?/i,'').replace(/\bII\b/i,'').replace(/\bIII\b/i,'');
   s = s.replace(/\s+/g,' ').trim();
-
-  // Alias map for books quirks
   const alias = {
     "Shohei Ohtani": ["Ohtani Shohei","S Ohtani"],
     "Kyle Schwarber": ["K Schwarber"],

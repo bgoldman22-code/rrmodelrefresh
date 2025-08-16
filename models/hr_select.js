@@ -1,6 +1,5 @@
-// models/hr_select.js
-// Select HR picks ensuring anchor stars are included when present.
-
+\
+/* models/hr_select.js */
 import { normalizePlayerName } from "../src/lib/common/name_map.js";
 
 const POWER_ANCHORS = new Set([
