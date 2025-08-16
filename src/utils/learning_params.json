@@ -1,0 +1,23 @@
+{
+  "w_R": 0.7,
+  "lambda": 0.4,
+  "gamma": 0.25,
+  "delta": 0.15,
+  "thresholds": {
+    "anchor_pR": 0.2,
+    "value_max": 2,
+    "latent_max": 1,
+    "per_game_cap": 2,
+    "max_picks": 12
+  },
+  "calibration": {
+    "R": {
+      "a": 0.0,
+      "b": 1.0
+    },
+    "V": {
+      "a": 0.0,
+      "b": 1.0
+    }
+  }
+}
