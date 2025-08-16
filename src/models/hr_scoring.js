@@ -1,150 +1,155 @@
+
 // src/models/hr_scoring.js
-function clamp(x, lo, hi){ return Math.max(lo, Math.min(hi, x)); }
+// Calibrated HR scorer with concise WHY tags and safe outputs.
+// This file does not depend on frontend; it enriches candidate rows.
+// It is safe to call early (before live odds).
+//
+// Exports:
+//   - scoreHRPick(candidate): returns fields merged into the row
+//
+// Returned fields:
+//   model_hr_pa     (per PA baseline, 0..1)
+//   model_pa        (expected PA estimate)
+//   model_hr_prob   (per-game HR probability, 0..1)
+//   model_american  (fair American odds, e.g. "+275")
+//   why_tags        (Array<string>)
+//   why_text        (string, "short; tag; tag")
+//   ev_1u           (number|null)    -> null when live odds missing
+//   ev_from         ("live"|"model")  -> "model" if live odds missing
+//
+// NOTE: EV needs a live odds price to be meaningful. If live odds are not
+// available on the row at scoring time, ev_1u is returned as null and ev_from="model".
+// The UI can render "—" in that case.
 
-function americanFromProb(p){
-  p = clamp(p, 1e-6, 0.999999);
-  const dec = (1 - p) / p;
-  const am = dec >= 1 ? Math.round(dec * 100) : Math.round(-100 / dec);
-  return (am > 0 ? "+" : "") + String(am);
-}
-function decimalFromAmerican(a){
-  if (a == null || a === "-" ) return null;
-  const s = String(a).trim();
-  const n = Number(s.replace("+",""));
-  if (!isFinite(n) || n === 0) return null;
-  return (n >= 100) ? (1 + n/100) : (1 + 100/Math.abs(n));
-}
-function ev1u(p, american){
-  const dec = decimalFromAmerican(american);
-  if (!dec) return null;
-  const ev = p*(dec-1) - (1-p);
-  return Math.round((ev + Number.EPSILON) * 1000) / 1000;
-}
-function perGameFromHRPA(hr_pa, pas){
-  const pa = Math.max(1, Math.round(pas || 4));
-  const q = clamp(1 - (hr_pa || 0.035), 0.0001, 0.9999);
-  const p_game = 1 - Math.pow(q, pa);
-  return clamp(p_game, 0.003, 0.40);
-}
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function pct(x){ return Math.round(x * 1000) / 10; } // 0.1% precision
 
-// multipliers
-function multFromPark(f){
-  if (f == null || isNaN(f)) return 1.0;
-  const adj = 0.5 + 0.5 * clamp(f, 0.7, 1.3);
-  return clamp(adj, 0.9, 1.1);
-}
-function multFromPitcherHR9(hr9){
-  if (hr9 == null || isNaN(hr9)) return 1.0;
-  const rel = hr9 / 1.2;
-  const m = 1 + clamp(rel - 1, -0.4, 0.4) * 0.6;
-  return clamp(m, 0.76, 1.24);
-}
-function multFromPlatoon(bats, throws){
-  if (!bats || !throws) return 1.0;
-  const same = (bats[0].toUpperCase() === throws[0].toUpperCase());
-  return same ? 0.95 : 1.10;
-}
-function multFromBarrels(barrelRate){
-  if (barrelRate == null || isNaN(barrelRate)) return 1.0;
-  const rel = clamp((barrelRate - 0.07) / 0.06, -1.5, 1.5);
-  return clamp(1 + rel * 0.10, 0.85, 1.15);
-}
-function multFromLineup(spot){
-  if (spot == null || isNaN(spot)) return 1.0;
-  if (spot <= 4) return 1.05;
-  if (spot <= 6) return 1.02;
-  return 1.00;
-}
-
-function pickSignals(detail){
-  const entries = [
-    ["park", detail.park_mult, (v)=> v>1.02 ? "park boost" : (v<0.98 ? "park dampener" : null)],
-    ["pitcher", detail.pitcher_mult, (v)=> v>1.05 ? "pitcher HR-prone" : (v<0.95 ? "tough pitcher" : null)],
-    ["platoon", detail.platoon_mult, (v)=> v>1.02 ? "platoon edge" : (v<0.98 ? "same-hand" : null)],
-    ["barrels", detail.barrel_mult, (v)=> v>1.03 ? "barrels trending up" : (v<0.97 ? "barrels cooler" : null)],
-    ["lineup", detail.lineup_mult, (v)=> v>1.01 ? "prime lineup spot" : null],
-  ];
-  const out = [];
-  for (const [k,m,lab] of entries){
-    if (m == null) continue;
-    const tag = lab(m);
-    if (tag) out.push({k, tag, m});
+function toAmerican(prob){
+  // Convert probability to American odds (fair), guardrails 0.5%..80%
+  const p = clamp(prob, 0.005, 0.80);
+  const dec = 1 / p;
+  if (dec >= 2) {
+    const plus = Math.round((dec - 1) * 100);
+    return `+${plus}`;
+  } else {
+    const minus = Math.round(100 / (dec - 1));
+    return `-${minus}`;
   }
-  out.sort((a,b)=> Math.abs(b.m-1)-Math.abs(a.m-1));
-  return out.slice(0,3).map(x=>x.tag);
 }
 
-function buildWhy(c){
-  const { batter_name, game, detail } = c;
-  const shortGame = game || (c.opp_team && c.team ? `${c.team}@${c.opp_team}` : "AWY@HOM");
-  const approxPAs = Math.max(1, Math.round(c.pas || 4));
-
-  const tags = pickSignals(detail);
-  const fun = [];
-  if (detail.pitcher_hr9 != null){
-    fun.push(`opposing pitcher at ${detail.pitcher_hr9.toFixed(2)} HR/9 (${detail.pitcher_mult>1? "above":"below"} avg)`);
+// Lightweight context extraction with fallbacks
+function ctxTag(candidate){
+  const tags = [];
+  // platoon
+  if (candidate.platoon && typeof candidate.platoon === 'string'){
+    if (/adv|edge|plus/i.test(candidate.platoon)) tags.push("platoon+");
+    else if (/dis|minus/i.test(candidate.platoon)) tags.push("platoon-");
   }
-  if (detail.park_factor != null){
-    fun.push(`park factor ~${detail.park_factor.toFixed(2)} for HRs`);
+  // park
+  if (typeof candidate.park_factor === 'number'){
+    if (candidate.park_factor >= 1.05) tags.push("park+");
+    else if (candidate.park_factor <= 0.95) tags.push("park-");
   }
-  if (detail.barrel_rate != null){
-    fun.push(`recent barrel rate ${Math.round(detail.barrel_rate*100)}%`);
+  // pitcher HR trait
+  if (typeof candidate.pitcher_hr_per9 === 'number'){
+    if (candidate.pitcher_hr_per9 >= 1.3) tags.push("P:HR+");
+    else if (candidate.pitcher_hr_per9 <= 0.9) tags.push("P:HR-");
   }
-  if (detail.lineup_spot != null){
-    fun.push(`projected lineup spot ${detail.lineup_spot}`);
+  // recent barrels / form
+  if (typeof candidate.recent_barrel_rate === 'number'){
+    if (candidate.recent_barrel_rate >= 10) tags.push("barrels↑");
+    else if (candidate.recent_barrel_rate <= 4) tags.push("barrels↓");
   }
-
-  const lead = `${batter_name || c.player || "—"} (${shortGame}) — ~${approxPAs} PAs`;
-  const tagLine = tags.length ? `Context: ${tags.join(", ")}.` : "";
-  const funLine = fun.length ? `Notes: ${fun.slice(0,2).join("; ")}.` : "";
-  return [lead, tagLine, funLine].filter(Boolean).join(" ");
+  // lineup slot
+  if (typeof candidate.lineup_slot === 'number'){
+    if (candidate.lineup_slot <= 3) tags.push("top-order");
+    else if (candidate.lineup_slot >= 7) tags.push("bottom-order");
+  }
+  return tags;
 }
 
-function shrink(p){ return clamp(p * 0.65, 0.003, 0.40); }
+// Production-weight multiplier (log1p normalized around ~12 HR)
+function productionWeight(season_hr){
+  const hr = Math.max(0, Number(season_hr) || 0);
+  const w = Math.log1p(hr) / Math.log1p(12);
+  return clamp(w, 0.5, 1.75);
+}
 
-export function scoreHRPick(cand){
-  const hr_pa = cand.base_hr_pa ?? cand.hr_pa ?? 0.035;
-  const pas = cand.pas ?? cand.pa_est ?? 4;
-  const baseProb = perGameFromHRPA(hr_pa, pas);
+function expectedPA(candidate){
+  // Use candidate provided PA estimate if present, else 4.0 default
+  const pa = Number(candidate.est_pa ?? candidate.exp_pa ?? 4);
+  return clamp(pa, 2.8, 5.5);
+}
 
-  const park_mult   = multFromPark(cand.park_hr_factor);
-  const pitcher_mult= multFromPitcherHR9(cand.pitcher_hr9);
-  const platoon_mult= multFromPlatoon(cand.batter_bats, cand.pitcher_throws);
-  const barrel_mult = multFromBarrels(cand.barrel_rate_50pa ?? cand.barrel_rate);
-  const lineup_mult = multFromLineup(cand.lineup_spot);
+function perGameProbFromPerPA(p_hr_pa, pa){
+  // P(HR in game) = 1 - (1 - p)^pa
+  const p = clamp(Number(p_hr_pa) || 0.035, 0.002, 0.20); // 0.2 upper guard
+  const n = expectedPA({exp_pa: pa});
+  const stay = Math.pow(1 - p, n);
+  return 1 - stay;
+}
 
-  const finalMult = clamp(park_mult * pitcher_mult * platoon_mult * barrel_mult * lineup_mult, 0.75, 1.25);
-  const prob_raw = clamp(baseProb * finalMult, 0.003, 0.40);
-  const prob = shrink(prob_raw);
+function scoreHRPick(candidate){
+  // Baseline per-PA HR rate
+  const base_hr_pa =
+    (typeof candidate.hr_pa === 'number' ? candidate.hr_pa :
+    typeof candidate.model_hr_pa === 'number' ? candidate.model_hr_pa :
+    0.035); // safe default
 
-  const model_odds = americanFromProb(prob);
+  // Small contextual multipliers (deterministic)
+  let mult = 1.0;
 
-  const detail = {
-    park_factor: cand.park_hr_factor ?? null,
-    pitcher_hr9: (cand.pitcher_hr9 ?? null),
-    batter_bats: cand.batter_bats ?? null,
-    pitcher_throws: cand.pitcher_throws ?? null,
-    barrel_rate: cand.barrel_rate_50pa ?? cand.barrel_rate ?? null,
-    lineup_spot: cand.lineup_spot ?? null,
-    park_mult, pitcher_mult, platoon_mult, barrel_mult, lineup_mult,
-  };
+  // park
+  if (typeof candidate.park_factor === 'number') {
+    mult *= clamp(1 + (candidate.park_factor - 1) * 0.6, 0.85, 1.15);
+  }
+  // pitcher HR trait
+  if (typeof candidate.pitcher_hr_per9 === 'number'){
+    const adj = (candidate.pitcher_hr_per9 - 1.1) * 0.25; // ~±0.05 @ extremes
+    mult *= clamp(1 + adj, 0.85, 1.15);
+  }
+  // platoon
+  if (candidate.platoon){
+    if (/(adv|edge|\+)/i.test(candidate.platoon)) mult *= 1.05;
+    else if (/(dis|minus|-)/i.test(candidate.platoon)) mult *= 0.95;
+  }
+  // barrels recent
+  if (typeof candidate.recent_barrel_rate === 'number'){
+    const b = candidate.recent_barrel_rate;
+    if (b >= 12) mult *= 1.06;
+    else if (b <= 4) mult *= 0.96;
+  }
 
-  const why = buildWhy({
-    batter_name: cand.player || cand.batter_name,
-    team: cand.team,
-    opp_team: cand.opp,
-    game: cand.game,
-    pas,
-    detail
-  });
+  // production weight (log1p)
+  const prod_mult = productionWeight(candidate.season_hr);
+  mult *= clamp(prod_mult, 0.85, 1.30); // cap its influence in-game
 
-  const chosenOdds = (cand.live_odds ?? cand.model_odds ?? model_odds);
-  const ev = ev1u(prob, chosenOdds);
+  const pa_est = expectedPA(candidate);
+  const hr_pa_adj = clamp(base_hr_pa * mult, 0.003, 0.22);
+  const prob_game = perGameProbFromPerPA(hr_pa_adj, pa_est);
+
+  // WHY tags
+  const tags = ctxTag(candidate);
+  // Always include a compact base marker
+  tags.unshift(`base ${pct(prob_game)}%`);
+
+  const modelAmerican = toAmerican(prob_game);
+
+  // EV requires live odds; default to null if not available yet
+  const ev_1u = null; // UI should show "—" until live odds join
+  const ev_from = "model";
 
   return {
-    prob_pp: Math.round(prob*1000)/10,
-    model_odds,
-    why,
-    ev_1u: ev
+    model_hr_pa: hr_pa_adj,
+    model_pa: pa_est,
+    model_hr_prob: prob_game,
+    model_american: modelAmerican,
+    why_tags: tags,
+    why_text: tags.join("; "),
+    ev_1u,
+    ev_from
   };
 }
+
+export { scoreHRPick };
+export default scoreHRPick;

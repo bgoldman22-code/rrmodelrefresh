@@ -1,69 +1,67 @@
+
 // scripts/sanitize-mlb.js
-// Keeps prior behavior (remove stray first-line garbage) AND injects scoreHRPick usage.
-// Safe to run repeatedly; it won't double-inject.
+// 1) remove any stray junk first line that Netlify occasionally prepends
+// 2) ensure MLB.jsx imports scoreHRPick
+// 3) ensure candidates are mapped through scoreHRPick
+// Idempotent: running multiple times won't duplicate injections.
 
 import fs from "fs";
 import path from "path";
-const MLB = path.join(process.cwd(), "src", "MLB.jsx");
 
-function stripGarbageHead(src){
-  const lines = src.split(/\r?\n/);
-  // Remove leading line if it starts with a quote or unexpected token like the Netlify header
-  if (lines.length && (/^["']\s?account_id=/.test(lines[0]) || /^<\!doctype/i.test(lines[0]) )){
-    lines.shift();
-    return {text: lines.join("\n"), removed: 1};
+function stripGarbage(filePath){
+  if (!fs.existsSync(filePath)) return { changed:false, removed:0 };
+  const raw = fs.readFileSync(filePath, "utf8");
+  const lines = raw.split(/\r?\n/);
+  let removed = 0;
+  // If first line looks like garbage (starts with a quote or angle bracket), drop it
+  if (lines.length && /^[<"\uFEFF]/.test(lines[0])){
+    lines.shift(); removed++;
   }
-  return {text: src, removed: 0};
+  const cleaned = lines.join("\n");
+  if (cleaned !== raw){
+    fs.writeFileSync(filePath, cleaned, "utf8");
+    return { changed:true, removed };
+  }
+  return { changed:false, removed:0 };
 }
 
-function ensureImport(text){
-  if (text.includes('from "./models/hr_scoring.js"')) return {text, added: false};
-  const lines = text.split(/\r?\n/);
-  let lastImportIdx = -1;
-  for (let i=0;i<lines.length;i++){
-    if (/^\s*import\s+/.test(lines[i])) lastImportIdx = i;
+function ensureImport(filePath){
+  let src = fs.readFileSync(filePath, "utf8");
+  if (!/from\s+["']\.\/models\/hr_scoring\.js["']/.test(src)){
+    // Place after React import
+    src = src.replace(
+      /(import\s+React[^;]+;\s*)/,
+      `$1\nimport { scoreHRPick } from "./models/hr_scoring.js";\n`
+    );
+    fs.writeFileSync(filePath, src, "utf8");
+    return true;
   }
-  const importLine = 'import { scoreHRPick } from "./models/hr_scoring.js";';
-  if (lastImportIdx >= 0){
-    lines.splice(lastImportIdx+1, 0, importLine);
-  } else {
-    lines.unshift(importLine);
-  }
-  return {text: lines.join("\n"), added: true};
+  return false;
 }
 
-function injectScorer(text){
-  if (text.includes("scoreHRPick(") && text.includes("...scoreHRPick")) {
-    return {text, injected: false};
+function injectScorerMap(filePath){
+  let src = fs.readFileSync(filePath, "utf8");
+  if (/\.map\s*\(\s*c\s*=>\s*\(\s*{\s*\.\.\.c\s*,\s*model_hr_prob/.test(src)){
+    // Already injected
+    return false;
   }
-  // Look for a line that declares cands from normalize or similar usage.
-  const candDecl = /(\b(?:let|const)\s+cands\s*=\s*[^;]+;)/;
-  const m = candDecl.exec(text);
-  if (!m) return {text, injected: false};
-  const insert = '\n  // ⬇︎ Injected: apply calibrated scorer to each candidate\n  cands = cands.map(c => ({ ...c, ...scoreHRPick(c) }));\n';
-  const newText = text.replace(candDecl, (full)=> full + insert);
-  return {text: newText, injected: true};
+  // Find a normalization line like: let cands = normalizeCandidates(...)
+  const pat = /(let\s+cands\s*=\s*[^;]+;)/;
+  if (pat.test(src)){
+    src = src.replace(pat, `$1\n// Inject scorer mapping (idempotent)\ncands = cands.map(c => ({ ...c, ...scoreHRPick(c) }));`);
+    fs.writeFileSync(filePath, src, "utf8");
+    return true;
+  }
+  return false;
 }
 
-try{
-  let src = fs.readFileSync(MLB, "utf8");
-  const res1 = stripGarbageHead(src);
-  let out = res1.text;
+function run(){
+  const mlbPath = path.join("src","MLB.jsx");
+  const garbage = stripGarbage(mlbPath);
+  const imp = ensureImport(mlbPath);
+  const inj = injectScorerMap(mlbPath);
 
-  const res2 = ensureImport(out);
-  out = res2.text;
-
-  const res3 = injectScorer(out);
-  out = res3.text;
-
-  fs.writeFileSync(MLB, out, "utf8");
-
-  const msgs = [];
-  if (res1.removed) msgs.push(`[sanitize] removed ${res1.removed} leading garbage line(s)`);
-  msgs.push(`[sanitize] import ${res2.added ? "added" : "kept"}`);
-  msgs.push(`[sanitize] scorer ${res3.injected ? "injected" : "kept"}`);
-  console.log(msgs.join(" • "));
-} catch (e){
-  console.error("[sanitize] failed:", e?.message || e);
-  process.exit(0); // don't fail the build on sanitize
+  console.log(`[sanitize] MLB.jsx: garbageRemoved=${garbage.removed} importAdded=${imp} scorerInjected=${inj}`);
 }
+
+run();
