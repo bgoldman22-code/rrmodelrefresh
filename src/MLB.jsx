@@ -1,6 +1,4 @@
 // src/MLB.jsx
-// UI patch: Preview/Locked rendering + RESTORED diagnostics footer with API details.
-
 import React, { useEffect, useState } from "react";
 import { buildPreviewPicksWithDiag, fetchOddsMap } from "./lib/preview_picks.js";
 
@@ -12,19 +10,12 @@ function todayYMD(){
   return `${y}-${m}-${dd}`;
 }
 
-async function getLocked(date){
-  const url = `/.netlify/blobs/picks/${date}.json`;
+async function getJsonOrNull(url){
   const res = await fetch(url, { headers: { "cache-control":"no-cache", "accept":"application/json" } });
-  if (!res.ok) {
-    return { locked: false, picks: [], meta: null, lockedStatus: res.status };
-  }
+  if (!res.ok) return null;
   const ct = res.headers.get("content-type")||"";
-  if (!ct.includes("application/json")) {
-    const txt = await res.text().catch(()=>"(non-text)");
-    throw new Error(`Non-JSON from ${url}: ${txt.slice(0,120)}`);
-  }
-  const payload = await res.json();
-  return { locked: true, picks: payload.picks || [], meta: payload, lockedStatus: 200 };
+  if (!ct.includes("application/json")) return null;
+  try { return await res.json(); } catch { return null; }
 }
 
 function americanFromPct(pct){
@@ -37,7 +28,7 @@ export default function MLB(){
   const [rows, setRows] = useState([]);
   const [diag, setDiag] = useState({
     mode: "waiting", date: todayYMD(), picks: 0, oddsEntries: 0,
-    endpointsTried: [], lockedStatus: null, notes: [], features: ["preview+locked", "diagnostics"]
+    endpointsTried: [], lockedStatus: null, notes: [], features: ["preview+locked", "diagnostics", "preview-blob"]
   });
 
   useEffect(() => {
@@ -45,57 +36,54 @@ export default function MLB(){
     const date = todayYMD();
 
     async function run(){
-      try{
-        // Try locked first
-        const locked = await getLocked(date);
-        if (cancelled) return;
-
-        if (locked.locked && (locked.picks?.length || 0) > 0){
-          const oddsMap = await fetchOddsMap().catch(()=> ({}));
-          if (cancelled) return;
-          const merged = (locked.picks || []).map(p => ({
-            ...p,
-            model_odds: americanFromPct(p.prob_pp),
-            live_odds: oddsMap[p.player] ?? "-",
-            why: Array.isArray(p.why) ? p.why.join(" • ") : (p.why || ""),
-          }));
-          setRows(merged);
-          setDiag(d => ({
-            ...d,
-            mode: "locked",
-            picks: merged.length,
-            oddsEntries: Object.keys(oddsMap||{}).length,
-            lockedStatus: 200,
-            notes: [(locked?.meta?.locked_at_et ? `Locked at ${locked.meta.locked_at_et} ET` : "Locked list present")],
-          }));
-          return;
-        }
-
-        // Preview fallback with detailed diagnostics
-        const { picks, endpointsTried, notes } = await buildPreviewPicksWithDiag();
-        if (cancelled) return;
+      // 1) Try LOCKED blob
+      const lockedUrl = `/.netlify/blobs/picks/${date}.json`;
+      const locked = await getJsonOrNull(lockedUrl);
+      if (cancelled) return;
+      if (locked?.picks?.length){
         const oddsMap = await fetchOddsMap().catch(()=> ({}));
-
-        const mergedPrev = picks.map(p => ({
+        if (cancelled) return;
+        const merged = locked.picks.map(p => ({
           ...p,
-          model_odds: americanFromPct(p.prob_pp),
+          model_odds: americanFromPct(p.prob_pp ?? 3.5),
           live_odds: oddsMap[p.player] ?? "-",
           why: Array.isArray(p.why) ? p.why.join(" • ") : (p.why || ""),
         }));
-
-        setRows(mergedPrev);
-        setDiag(d => ({
-          ...d,
-          mode: "preview",
-          picks: mergedPrev.length,
-          oddsEntries: Object.keys(oddsMap||{}).length,
-          endpointsTried,
-          lockedStatus: locked.lockedStatus,
-          notes: notes.length ? notes : ["Preview — Official list will lock at 11:00 AM ET"],
-        }));
-      }catch(e){
-        setDiag(d => ({ ...d, notes: [String(e?.message || e)] }));
+        setRows(merged);
+        setDiag(d => ({ ...d, mode: "locked", picks: merged.length, oddsEntries: Object.keys(oddsMap||{}).length, lockedStatus: 200, notes: [`Locked at ${locked.locked_at_et || "—"} ET`] }));
+        return;
       }
+
+      // 2) Try PREVIEW blob
+      const previewUrl = `/.netlify/blobs/picks/${date}.preview.json`;
+      const preview = await getJsonOrNull(previewUrl);
+      if (cancelled) return;
+      if (preview?.picks?.length){
+        const oddsMap = await fetchOddsMap().catch(()=> ({}));
+        if (cancelled) return;
+        const mergedPrev = preview.picks.map(p => ({
+          ...p,
+          model_odds: americanFromPct(p.prob_pp ?? 3.5),
+          live_odds: oddsMap[p.player] ?? "-",
+          why: Array.isArray(p.why) ? p.why.join(" • ") : (p.why || ""),
+        }));
+        setRows(mergedPrev);
+        setDiag(d => ({ ...d, mode: "preview", picks: mergedPrev.length, oddsEntries: Object.keys(oddsMap||{}).length, lockedStatus: 404, notes: ["Preview — Official list will lock at 11:00 AM ET (from preview blob)"] }));
+        return;
+      }
+
+      // 3) Fallback to function + odds parsing
+      const { picks, endpointsTried, notes } = await buildPreviewPicksWithDiag();
+      const oddsMap = await fetchOddsMap().catch(()=> ({}));
+      if (cancelled) return;
+      const mergedFunc = picks.map(p => ({
+        ...p,
+        model_odds: americanFromPct(p.prob_pp ?? 3.5),
+        live_odds: oddsMap[p.player] ?? "-",
+        why: Array.isArray(p.why) ? p.why.join(" • ") : (p.why || ""),
+      }));
+      setRows(mergedFunc);
+      setDiag(d => ({ ...d, mode: "preview", picks: mergedFunc.length, oddsEntries: Object.keys(oddsMap||{}).length, endpointsTried, lockedStatus: 404, notes: notes.length ? notes : ["Preview — Official list will lock at 11:00 AM ET"] }));
     }
 
     run();
@@ -143,7 +131,6 @@ export default function MLB(){
         </tbody>
       </table>
 
-      {/* Restored diagnostics footer */}
       <div className="mt-4 p-3 bg-gray-50 rounded border text-xs">
         <div className="font-semibold mb-1">Diagnostics</div>
         <div>Picks: {diag.picks} • Live odds entries: {diag.oddsEntries}</div>
@@ -157,14 +144,6 @@ export default function MLB(){
                   <span className="font-mono">{e.url}</span> — status {e.status}, items {e.items}
                 </li>
               ))}
-            </ul>
-          </div>
-        ) : null}
-        {diag.notes?.length > 1 ? (
-          <div className="mt-1">
-            <div className="font-medium">Notes:</div>
-            <ul className="list-disc ml-4">
-              {diag.notes.slice(1).map((n,i)=> <li key={i}>{n}</li>)}
             </ul>
           </div>
         ) : null}

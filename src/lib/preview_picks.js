@@ -1,6 +1,4 @@
 // src/lib/preview_picks.js
-// Diagnostics-aware preview picker. Normalizes multiple shapes and records endpoint results.
-
 function pctFromBase(it){
   const base = Number(it.prob_pp ?? it.hr_prob_pp ?? it.base_prob ?? 3.5);
   return Number.isFinite(base) ? base : 3.5;
@@ -21,7 +19,7 @@ function normalizeCandidates(raw){
   const rows = extractArray(raw);
   const out = [];
   for (const it of rows){
-    const rec = it.player ? it : (it.props || it.item || it);
+    const rec = it?.player ? it : (it?.props || it?.item || it || {});
     const player = rec.player || rec.name || rec.Player || rec.player_name;
     if (!player) continue;
     const team = rec.team || rec.Team || rec.team_code || "—";
@@ -42,18 +40,16 @@ async function getJSON(url){
   const res = await fetch(url, { headers: { "cache-control":"no-cache", "accept":"application/json" } });
   const status = res.status;
   try {
-    if (!res.ok) {
-      return { status, data: null, items: 0, nonjson: null };
-    }
+    if (!res.ok) return { status, data: null, items: 0, nonjson: null };
     const ct = res.headers.get("content-type")||"";
-    if (!ct.includes("application/json")) {
+    if (!ct.includes("application/json")){
       const txt = await res.text().catch(()=>"(non-text)");
       return { status, data: null, items: 0, nonjson: txt.slice(0,120) };
     }
     const data = await res.json();
     const items = Array.isArray(data) ? data.length : (Array.isArray(data?.candidates) ? data.candidates.length : 0);
     return { status, data, items, nonjson: null };
-  } catch (_e){
+  } catch(_e){
     return { status, data: null, items: 0, nonjson: "parse_error" };
   }
 }
@@ -88,7 +84,6 @@ export async function fetchOddsMap(){
   return {};
 }
 
-// Props fallback builder
 async function buildFromProps(endpointsTried){
   const endpoints = [
     "/.netlify/functions/odds-props?league=mlb&markets=player_to_hit_a_home_run&regions=us",
@@ -131,7 +126,7 @@ export async function buildPreviewPicksWithDiag(){
   const endpointsTried = [];
   const notes = [];
 
-  // 1) Try model endpoint
+  // Model function first
   {
     const url = "/.netlify/functions/odds-mlb-hr";
     const { status, data } = await getJSON(url);
@@ -144,7 +139,7 @@ export async function buildPreviewPicksWithDiag(){
     if (status !== 200) notes.push(`Model endpoint ${status}`);
   }
 
-  // 2) Fallback: props
+  // Fallback to props
   const propCands = await buildFromProps(endpointsTried);
   if (propCands.length){
     propCands.sort((a,b)=> b.prob_pp - a.prob_pp);
@@ -152,7 +147,6 @@ export async function buildPreviewPicksWithDiag(){
     return { picks: propCands.slice(0, 12), endpointsTried, notes };
   }
 
-  // 3) Nothing available
   notes.push("No live markets available right now.");
   return { picks: [], endpointsTried, notes };
 }

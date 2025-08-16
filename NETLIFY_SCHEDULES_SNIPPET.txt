@@ -1,0 +1,9 @@
+# Append to your netlify.toml
+
+[[scheduled.functions]]
+  name = "generate_preview"
+  cron = "*/15 * * * *"
+
+[[scheduled.functions]]
+  name = "lock_picks"
+  cron = "0 15 * * *"  # 11:00 ET during EDT
