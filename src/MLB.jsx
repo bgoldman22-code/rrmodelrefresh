@@ -1,211 +1,331 @@
-import React, { useEffect, useState } from "react";
-import { impliedFromAmerican, evFromProbAndOdds } from "./utils/ev.js";
-import { hotColdMultiplier } from "./utils/hotcold.js";
-import { normName, buildWhy } from "./utils/why.js";
+// src/MLB.jsx
+import React, { useEffect, useMemo, useState } from "react";
 
-const CAL_LAMBDA = 0.25;
-const HOTCOLD_CAP = 0.06;
-const MIN_PICKS = 12;
-const MAX_PER_GAME = 2;
+/**
+ * Hardening goals:
+ * - Never show uniform HR%: we compute per-row display prob from whatever inputs we have.
+ * - EV only when we truly have a live American price.
+ * - WHY: compact bullet-ish tags, not a single "base X%" line.
+ * - Works even if odds APIs are thin/empty (model still renders).
+ */
 
-function fmtET(date=new Date()){
-  return new Intl.DateTimeFormat("en-US", { timeZone:"America/New_York", month:"short", day:"2-digit", year:"numeric"}).format(date);
+// ---------- Small utils (no external deps) ----------
+function clamp(x, lo, hi){ return Math.min(hi, Math.max(lo, x)); }
+function round1(x){ return Math.round(x * 10) / 10; }
+function round1pct(x){ return round1(x * 100); }
+function americanFromProb(p){
+  // p in [0,1]; return American as string like "+250" or "-135"
+  if (p <= 0) return "—";
+  if (p >= 1) return "-100000";
+  const dec = 1 / p;
+  if (dec >= 2) { // underdog
+    return `+${Math.round((dec - 1) * 100)}`;
+  } else { // favorite
+    return `-${Math.round(100 / (dec - 1))}`;
+  }
 }
-function dateISO_ET(offsetDays=0){
-  const d = new Date();
-  const et = new Intl.DateTimeFormat("en-CA",{ timeZone:"America/New_York", year:"numeric", month:"2-digit", day:"2-digit" }).format(d);
-  const base = new Date(et+"T00:00:00Z");
-  base.setUTCDate(base.getUTCDate()+offsetDays);
-  return new Intl.DateTimeFormat("en-CA",{ timeZone:"America/New_York", year:"numeric", month:"2-digit", day:"2-digit" }).format(base);
+function americanToDecimal(american){
+  if (american == null) return null;
+  if (typeof american === "number") american = String(american);
+  if (american === "—" || american.trim() === "") return null;
+  const v = parseInt(american, 10);
+  if (isNaN(v)) return null;
+  return v > 0 ? (1 + v/100) : (1 + 100/Math.abs(v));
 }
-async function fetchJSON(url){
-  const r = await fetch(url, { headers:{ "accept":"application/json" }, cache:"no-store" });
-  if(!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-  return r.json();
+function ev1u(prob, american){
+  const dec = americanToDecimal(american);
+  if (!dec) return null;
+  // EV(1u) = prob*(dec-1) - (1-prob)
+  return prob * (dec - 1) - (1 - prob);
+}
+
+// Strip weird zero-width & stray unicode that broke names previously
+function cleanName(s){
+  if (!s) return s;
+  return String(s)
+    .replace(/[\u200B-\u200F\uFEFF\u2060]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Some players are true boppers; give them a gentle continuous boost via log1p(HR).
+// If season_hr unknown, weight_scale=1.0
+function productionWeightScale(season_hr){
+  if (season_hr == null) return 1.0;
+  const anchor = 12; // ~league-average-ish for a solid power bat
+  const scale = Math.log1p(Math.max(0, season_hr)) / Math.log1p(anchor);
+  return clamp(scale, 0.5, 1.75);
+}
+
+// Build WHY tags based on whatever fields are present on the candidate.
+// We *intentionally* keep these short, not full sentences.
+function buildWhyTags(c){
+  const tags = [];
+  // Base prob (always)
+  const base = typeof c.model_hr_prob === "number" ? c.model_hr_prob
+             : (typeof c.base_hr_prob === "number" ? c.base_hr_prob
+             : (typeof c.base_hr_pa === "number" ? c.base_hr_pa * (c.est_pas ?? 4) : null));
+  if (typeof base === "number") tags.push(`base ${round1pct(base)}%`);
+
+  // Platoon
+  const bh = (c.bats || c.bats_hand || "").toUpperCase();
+  const ph = (c.pitcher_hand || c.opp_pitch_hand || "").toUpperCase();
+  if ((bh === "L" && ph === "R") || (bh === "R" && ph === "L")) tags.push("platoon+");
+  else if ((bh === "L" && ph === "L") || (bh === "R" && ph === "R")) tags.push("platoon-");
+
+  // Park
+  if (typeof c.park_hr_factor === "number"){
+    if (c.park_hr_factor >= 1.08) tags.push("park++");
+    else if (c.park_hr_factor >= 1.02) tags.push("park+");
+    else if (c.park_hr_factor <= 0.92) tags.push("park--");
+    else if (c.park_hr_factor <= 0.98) tags.push("park-");
+  }
+
+  // Pitcher HR tendency (per 9)
+  if (typeof c.pitcher_hr9 === "number"){
+    if (c.pitcher_hr9 >= 1.5) tags.push("P:HR++");
+    else if (c.pitcher_hr9 >= 1.2) tags.push("P:HR+");
+    else if (c.pitcher_hr9 <= 0.7) tags.push("P:HR--");
+  }
+
+  // Recent barrels/HH (best-effort; naming varies)
+  const recentBarrels = c.recent_barrels_per_bbe ?? c.recent_barrels_rate ?? null;
+  if (typeof recentBarrels === "number"){
+    if (recentBarrels >= 0.12) tags.push("barrels↑");
+    else if (recentBarrels <= 0.05) tags.push("barrels↓");
+  }
+  const recentHR = c.hr_last_7 ?? c.hr_last_10 ?? null;
+  if (typeof recentHR === "number"){
+    if (recentHR >= 3) tags.push("hot");
+  }
+
+  // Order & PA
+  if (typeof c.order === "number"){
+    if (c.order <= 3) tags.push("top-order");
+    else if (c.order >= 7) tags.push("down-order");
+  }
+  if (typeof c.est_pas === "number"){
+    if (c.est_pas >= 4.7) tags.push("5PA");
+    else if (c.est_pas <= 3.6) tags.push("3-PA risk");
+  }
+
+  // If model had a reason list already, keep a couple of them
+  if (Array.isArray(c.why_tags)){
+    for (const t of c.why_tags){
+      if (tags.length >= 7) break;
+      if (typeof t === "string" && t.length > 1) tags.push(t);
+    }
+  }
+
+  // de-dupe
+  const seen = new Set(); const out=[];
+  for (const t of tags){
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+
+// Score one candidate into a display row
+function scoreCandidate(c){
+  const name = cleanName(c.player || c.name || "");
+  // Try to use any provided model probability per game if present
+  let p = null;
+
+  if (typeof c.model_hr_prob === "number") {
+    p = c.model_hr_prob; // already per-game
+  } else if (typeof c.model_hr_pa === "number") {
+    const pas = c.est_pas ?? 4;
+    const pa = clamp(pas, 0, 6);
+    p = 1 - Math.pow(1 - c.model_hr_pa, pa);
+  } else if (typeof c.base_hr_pa === "number") {
+    const pas = c.est_pas ?? 4;
+    const pa = clamp(pas, 0, 6);
+    p = 1 - Math.pow(1 - c.base_hr_pa, pa);
+  } else {
+    // absolute fallback
+    const pas = c.est_pas ?? 4;
+    const pa = clamp(pas, 0, 6);
+    const base = 0.035; // 3.5%/PA
+    p = 1 - Math.pow(1 - base, pa);
+  }
+
+  // Gentle calibration via production weight (if season_hr exists)
+  const season_hr = c.season_hr ?? c.hr_season ?? c.hr_2025 ?? null;
+  const weight = productionWeightScale(season_hr);
+  const p_cal = clamp(p * (0.85 + 0.15 * weight), 0.01, 0.80); // keep in sane range
+
+  const whyTags = buildWhyTags({ ...c, model_hr_prob: p });
+
+  // live odds from any attached offers map, or from normalized field
+  const americanLive = (typeof c.live_american === "string" || typeof c.live_american === "number")
+    ? String(c.live_american)
+    : (c.odds_american ?? null);
+
+  const americanModel = americanFromProb(p_cal);
+  const ev = ev1u(p_cal, americanLive);
+
+  // game label
+  const g = (c.game || c.game_label || `${c.away ?? "AWY"}@${c.home ?? "HOM"}`);
+
+  return {
+    player: name || "—",
+    team: c.team ?? c.team_code ?? "—",
+    game: g,
+    modelProb: p_cal,         // 0..1
+    modelAmerican: americanModel,
+    liveAmerican: americanLive ?? "—",
+    ev1u: ev,                 // null if no live price
+    why: whyTags.length ? whyTags.join("; ") : `base ${round1pct(p)}%`,
+  };
+}
+
+// Fetch odds props from multiple endpoints; return best-effort offers map {Player: "+450", ...}
+async function fetchLiveOdds(){
+  const urls = [
+    "/.netlify/functions/odds-props?league=mlb&markets=player_to_hit_a_home_run&regions=us",
+    "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_to_hit_a_home_run&regions=us",
+    "/.netlify/functions/odds-props?league=mlb&regions=us",
+    "/.netlify/functions/odds-props?sport=baseball_mlb&regions=us",
+  ];
+  const offers = {};
+  const tried = [];
+  for (const u of urls){
+    try {
+      const r = await fetch(u);
+      const txt = await r.text();
+      tried.push(`${u} — status ${r.status}`);
+      if (!r.ok) continue;
+      let json = null;
+      try { json = JSON.parse(txt); }
+      catch { continue; }
+      // two shapes: (a) oddsapi-like events array; (b) flat k/v map
+      if (Array.isArray(json)){
+        for (const evt of json){
+          // attempt common mapping
+          const markets = evt?.bookmakers?.[0]?.markets || evt?.markets || [];
+          for (const m of markets){
+            if ((m.key || "").includes("home_run")){
+              for (const o of (m.outcomes || [])){
+                const nm = cleanName(o.name);
+                if (!nm) continue;
+                const price = (typeof o.price === "number") ? o.price : (o.american ?? null);
+                if (price != null && offers[nm] == null){
+                  offers[nm] = String(price);
+                }
+              }
+            }
+          }
+        }
+      } else if (json && typeof json === "object"){
+        for (const [k,v] of Object.entries(json)){
+          offers[cleanName(k)] = String(v);
+        }
+      }
+    } catch (e){
+      tried.push(`${u} — error`);
+    }
+  }
+  return { offers, tried };
 }
 
 export default function MLB(){
-  const [picks, setPicks] = useState([]);
-  const [meta, setMeta]   = useState({});
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState("");
+  const [rows, setRows] = useState([]);
+  const [diag, setDiag] = useState({ candidates: 0, oddsTried: [], usingOddsApi: false });
 
-  async function getCalibration(){
-    try{ const j = await fetchJSON("/.netlify/functions/mlb-calibration"); return j?.global?.scale ? j : { global:{ scale:1.0 }, bins:[] }; }
-    catch{ return { global:{ scale:1.0 }, bins:[] }; }
+  async function generate(){
+    // 1) grab candidates from your primary HR model function
+    const r = await fetch("/.netlify/functions/odds-mlb-hr");
+    const base = await r.json().catch(()=>([]));
+    const candidates = Array.isArray(base) ? base : (base?.candidates || []);
+    // 2) live odds
+    const { offers, tried } = await fetchLiveOdds();
+
+    // 3) score & map
+    const mapped = candidates.map(c => {
+      // stitch live american if available by player name
+      const nm = cleanName(c.player || c.name || "");
+      const live = offers[nm];
+      const scored = scoreCandidate({ ...c, live_american: live });
+      return scored;
+    });
+
+    // 4) sort by EV when present, else by model prob
+    mapped.sort((a,b) => {
+      const ea = (typeof a.ev1u === "number") ? a.ev1u : -1e9;
+      const eb = (typeof b.ev1u === "number") ? b.ev1u : -1e9;
+      if (ea !== eb) return eb - ea;
+      return b.modelProb - a.modelProb;
+    });
+
+    setRows(mapped.slice(0, 50));
+    setDiag({ candidates: candidates.length, oddsTried: tried, usingOddsApi: Object.keys(offers).length > 0 });
   }
 
-  async function tryEndpoints(endpoints){
-    for(const url of endpoints){
-      try{
-        const j = await fetchJSON(url);
-        if(Array.isArray(j?.candidates) && j.candidates.length>0) return j.candidates;
-        if(Array.isArray(j?.rows) && j.rows.length>0) return j.rows;
-      }catch(e){ /* try next */ }
-    }
-    return [];
-  }
-
-  async function getSlate(){
-    const endpoints = [
-      "/.netlify/functions/mlb-slate-lite",
-      "/.netlify/functions/mlb-slate",
-      "/.netlify/functions/mlb-candidates",
-      "/.netlify/functions/mlb-schedule",
-    ];
-    const cand = await tryEndpoints(endpoints);
-    if(cand.length>0) return cand;
-    throw new Error("No candidate endpoint returned players.");
-  }
-
-  async function getHotColdBulk(ids){
-    try{
-      const end = dateISO_ET(0);
-      const d = new Date(end+"T00:00:00");
-      d.setDate(d.getDate()-13);
-      const beg = new Intl.DateTimeFormat("en-CA", { timeZone:"America/New_York", year:"numeric", month:"2-digit", day:"2-digit" }).format(d);
-      const url = `https://statsapi.mlb.com/api/v1/people?personIds=${ids.join(",")}&hydrate=stats(group=hitting,type=byDateRange,beginDate=${beg},endDate=${end})`;
-      const j = await fetchJSON(url);
-      const out = new Map();
-      for(const p of (j.people||[])){
-        const sid = p?.id;
-        let hr14=0, pa14=0;
-        for(const s of (p?.stats||[])){
-          for(const sp of (s?.splits||[])){
-            hr14 += Number(sp?.stat?.homeRuns || 0);
-            pa14 += Number(sp?.stat?.plateAppearances || 0);
-          }
-        }
-        out.set(String(sid), { hr14, pa14 });
-      }
-      return out;
-    }catch{ return new Map(); }
-  }
-
-  async function getOddsMap(){
-    try{
-      const j = await fetchJSON("/.netlify/functions/prewarm-odds-v2?market=player_home_run");
-      const map = new Map();
-      const arr = j?.data || j?.rows || [];
-      for(const r of arr){
-        if(r?.player && r?.best_american){
-          map.set(String(r.player).toLowerCase(), { american:r.best_american, book:r.book||"best" });
-        }
-      }
-      return map;
-    }catch{ return new Map(); }
-  }
-
-  function applyCalibration(p, scale){
-    const scaled = Math.max(0.0005, Math.min(0.95, p * scale));
-    return (1 - CAL_LAMBDA) * p + CAL_LAMBDA * scaled;
-  }
-
-  
-  async function build(){
-    setLoading(true); setMessage(""); setPicks([]);
-    try{
-      const [cals, baseCandidates] = await Promise.all([ getCalibration(), getSlate() ]);
-      const ids = baseCandidates.map(x => x.batterId).filter(Boolean);
-      const [hotMap, oddsMap] = await Promise.all([ getHotColdBulk(ids), getOddsMap() ]);
-
-      const rows = [];
-      for(const c of baseCandidates){
-        let p = Number(c.baseProb||c.prob||0);
-        if(!p || p<=0) continue;
-        const hc = hotMap.get(String(c.batterId)) || { hr14:0, pa14:0 };
-        const hcMul = hotColdMultiplier({ hr14:hc.hr14, pa14:hc.pa14, seasonHR:Number(c.seasonHR||0), seasonPA:Number(c.seasonPA||0) }, HOTCOLD_CAP);
-        p = p * hcMul;
-        const calScale = Number(cals?.global?.scale || 1.0);
-        p = applyCalibration(p, calScale);
-
-        const key = String(c.name||"").toLowerCase();
-        const found = oddsMap.get(key);
-        const american = found?.american ?? americanFromProb(p);
-        const ev = evFromProbAndOdds(p, american);
-
-        rows.push({
-          name: c.name,
-          team: c.team,
-          game: c.gameId || c.game || c.opp || "",
-          batterId: c.batterId,
-          p_model: p,
-          american,
-          ev,
-          why: explainRow({ baseProb:Number(c.baseProb||c.prob||0), hotBoost:hcMul, calScale }),
-        });
-      }
-
-      rows.sort((a,b)=> b.ev - a.ev);
-
-      const out = [];
-      const perGame = new Map();
-      for(const r of rows){
-        const g = r.game || "UNK";
-        const n = perGame.get(g)||0;
-        if(n >= MAX_PER_GAME) continue;
-        out.push(r);
-        perGame.set(g, n+1);
-        if(out.length>=MIN_PICKS) break;
-      }
-
-      setPicks(out);
-      setMeta({
-        date: fmtET(),
-        totalCandidates: baseCandidates.length,
-        usedOdds: oddsMap.size>0,
-        calibrationScale: Number(cals?.global?.scale || 1.0),
-      });
-      if(out.length < MIN_PICKS){
-        setMessage(`Small slate or limited data — picked ${out.length} best by EV (max ${MAX_PER_GAME} per game).`);
-      }
-    }catch(e){
-      console.error(e);
-      setMessage(String(e?.message||e));
-    }finally{
-      setLoading(false);
-    }
-  }
-
-  useEffect(()=>{}, []);
+  useEffect(() => { generate(); }, []);
 
   return (
-    <div className="p-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">MLB HR — Calibrated + Hot/Cold + Odds-first EV</h1>
-        <button onClick={build} className="px-3 py-2 bg-blue-600 text-white rounded" disabled={loading}>
-          {loading ? "Working..." : "Generate"}
-        </button>
+    <div className="p-4 max-w-6xl mx-auto">
+      <h2 className="text-xl font-semibold mb-2">MLB HR — Calibrated + Hot/Cold + Odds-first EV</h2>
+      <div className="text-sm text-gray-600 mb-4">
+        Date (ET): {new Date().toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day:"numeric", year:"numeric"})}
+        {" "}
+        • Candidates: {diag.candidates}
+        {" "}
+        • Using OddsAPI: {diag.usingOddsApi ? "yes" : "no"}
       </div>
-      {message && <div className="mt-3 text-red-700">{message}</div>}
-      <div className="mt-2 text-sm text-gray-600">
-        Date (ET): {meta.date} • Candidates: {meta.totalCandidates||0} • Using OddsAPI: {meta.usedOdds ? "yes":"no"} • Calibration scale: {meta.calibrationScale?.toFixed(2)}
-      </div>
-      <div className="mt-4 overflow-x-auto">
-        <table className="min-w-full text-sm">
-          <thead>
-            <tr className="bg-gray-100">
-              <th className="px-3 py-2 text-left">Player</th>
-              <th className="px-3 py-2 text-left">Game</th>
-              <th className="px-3 py-2 text-right">Model HR%</th>
-              <th className="px-3 py-2 text-right">American</th>
-              <th className="px-3 py-2 text-right">EV (1u)</th>
-              <th className="px-3 py-2 text-left">Why</th>
+
+      <button
+        onClick={generate}
+        className="px-3 py-2 mb-3 rounded bg-blue-600 text-white hover:bg-blue-700"
+      >
+        Generate
+      </button>
+
+      <div className="overflow-x-auto">
+        <table className="min-w-full border text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="p-2 border">Player</th>
+              <th className="p-2 border">Team</th>
+              <th className="p-2 border">Game</th>
+              <th className="p-2 border">Model HR%</th>
+              <th className="p-2 border">American</th>
+              <th className="p-2 border">EV (1u)</th>
+              <th className="p-2 border">Why</th>
             </tr>
           </thead>
           <tbody>
-            {picks.map((r,i)=> (
-              <tr key={i} className="border-b">
-                <td className="px-3 py-2">{r.name}</td>
-                <td className="px-3 py-2">{r.game}</td>
-                <td className="px-3 py-2 text-right">{(r.p_model*100).toFixed(1)}%</td>
-                <td className="px-3 py-2 text-right">{r.american>0?`+${r.american}`:r.american}</td>
-                <td className="px-3 py-2 text-right">{r.ev.toFixed(3)}</td>
-                <td className="px-3 py-2">{r.why}</td>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={7} className="p-4 text-center text-gray-500">Waiting for today’s preview…</td>
+              </tr>
+            )}
+            {rows.map((r, idx) => (
+              <tr key={idx} className="odd:bg-white even:bg-gray-50">
+                <td className="p-2 border whitespace-nowrap">{r.player}</td>
+                <td className="p-2 border text-center">{r.team}</td>
+                <td className="p-2 border text-center">{r.game}</td>
+                <td className="p-2 border text-center">{round1pct(r.modelProb)}%</td>
+                <td className="p-2 border text-center">{r.liveAmerican ?? "—"}</td>
+                <td className="p-2 border text-center">
+                  {typeof r.ev1u === "number" ? (Math.round(r.ev1u*1000)/1000).toFixed(3) : "—"}
+                </td>
+                <td className="p-2 border">{r.why}</td>
               </tr>
             ))}
           </tbody>
         </table>
+      </div>
+
+      <div className="mt-4 text-xs text-gray-600">
+        <div className="font-semibold mb-1">Diagnostics</div>
+        <div>Picks: {rows.length} • Live odds entries: (best-effort)</div>
+        <div className="mt-1">
+          Odds endpoints tried:
+          <ul className="list-disc ml-5">
+            {diag.oddsTried.map((t,i)=>(<li key={i}>{t}</li>))}
+          </ul>
+        </div>
       </div>
     </div>
   );
