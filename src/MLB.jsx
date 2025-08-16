@@ -1,4 +1,4 @@
-// src/MLB.jsx
+// src/MLB.jsx — HOTFIX: fetch from Netlify Blobs public path
 import React, { useEffect, useState } from "react";
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
@@ -13,27 +13,27 @@ async function tryFetchJSON(url){
   }
   return res.json();
 }
+
 async function ensureLocked(date){
-  // Try to fetch; if missing (404 or HTML), trigger lock then retry once
+  const picksUrl = `/.netlify/blobs/picks/${date}.json`;
   try{
-    return await tryFetchJSON(`/picks/${date}.json`);
+    return await tryFetchJSON(picksUrl);
   }catch(e){
-    // Kick the function to generate today's file (idempotent)
-    await fetch(`/.netlify/functions/lock_picks`, { method: "GET" }).catch(()=>{});
-    // small delay
+    // Try to generate once then refetch
+    await fetch(`/.netlify/functions/lock_picks`).catch(()=>{});
     await new Promise(r=> setTimeout(r, 800));
-    return await tryFetchJSON(`/picks/${date}.json`);
+    return await tryFetchJSON(picksUrl);
   }
 }
 async function getOdds(date){
+  const oddsUrl = `/.netlify/blobs/odds/${date}.json`;
   try{
-    return await tryFetchJSON(`/odds/${date}.json`);
+    return await tryFetchJSON(oddsUrl);
   }catch{
-    // Try to refresh once
     await fetch(`/.netlify/functions/update_odds`).catch(()=>{});
     await new Promise(r=> setTimeout(r, 500));
     try{
-      return await tryFetchJSON(`/odds/${date}.json`);
+      return await tryFetchJSON(oddsUrl);
     }catch{
       return {};
     }
@@ -123,7 +123,6 @@ function fmtPct(x){
   return `${p}%`;
 }
 function toAmericanFromPct(pp){
-  // pp = percent (e.g., 16.4)
   const p = Math.min(99.999, Math.max(0.001, Number(pp||0))) / 100;
   if (p >= 0.5) return -Math.round(100 * p / (1-p));
   return `+${Math.round(100 * (1-p) / p)}`;

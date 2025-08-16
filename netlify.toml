@@ -1,28 +1,26 @@
-# netlify.toml — drop-in with daily lock + odds updater schedules
+# netlify.toml — HOTFIX: ensure JSON served from Blobs, not SPA index.html
 [build]
   command = "npm run build"
   publish = "dist"
 
 [functions]
   node_bundler = "esbuild"
-
-  # External deps for functions
   [functions."*"]
     external_node_modules = ["@netlify/blobs", "@supabase/supabase-js"]
 
-# Redirect SPA routes
+# Serve blobs for these prefixes BEFORE SPA catch-all
+[[redirects]]
+  from = "/picks/*"
+  to = "/.netlify/blobs/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/odds/*"
+  to = "/.netlify/blobs/:splat"
+  status = 200
+
+# SPA fallback
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
-
-# Schedules
-# Daily lock at 11:00 AM ET (15:00 UTC during EDT)
-[[scheduled.functions]]
-  name = "lock_picks"
-  cron = "0 15 * * *"
-
-# Odds updater every 10 minutes
-[[scheduled.functions]]
-  name = "update_odds"
-  cron = "*/10 * * * *"
