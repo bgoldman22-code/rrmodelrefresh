@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-enrich-picks";
+const MODEL_VERSION = "1.4.3-hotfix-odds-blend-no-nameclean";
 
 function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
 function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
@@ -26,7 +26,6 @@ function choose(n, k){
   for (let i=1; i<=k; i++) r = (r*(n - (k-i)))/i;
   return Math.round(r);
 }
-function cleanName(name){ return String(name||"").replace(/[\u200B-\u200D\u2060]/g, ""); }
 
 function normalizeCandidates(raw){
   const out = [];
@@ -76,6 +75,7 @@ async function fetchPrimary(){
   try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
 async function fetchOddsContext(){
+  const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set(), tried: [] };
   const urls = [
     "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
     "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
@@ -108,8 +108,9 @@ async function fetchOddsContext(){
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
             const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
-            const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
-            if (!isHR && mk.key) continue;
+            const texty = (mk.key_name || mk.market || mk.key || "").toLowerCase();
+            const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run") || texty.includes("home run");
+            if (!isHR) continue;
             for (const oc of (mk.outcomes||[])){
               const player = clean(oc.name || oc.description || oc.participant || "");
               let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
@@ -126,7 +127,7 @@ async function fetchOddsContext(){
           }
         }
       }
-    }catch{/* try next */}
+    }catch{/* keep trying next */}
     if (byGamePlayer.size) break;
   }
   const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
@@ -152,24 +153,52 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   return best;
 }
 
-function heuristicProb(p){
-  let prob = 0.035;
-  if (p.iso != null) prob += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04);
-  if (p.barrelRate != null) prob += clamp((Number(p.barrelRate)-0.07)*0.35, -0.01, 0.05);
-  if (p.recentHRperPA != null) prob += clamp(Number(p.recentHRperPA)*0.6, 0, 0.05);
-  if (p.starterHR9 != null) prob += clamp((Number(p.starterHR9)-1.0)*0.015, -0.015, 0.03);
-  prob = clamp(prob, 0.01, 0.20);
-  return prob;
+function featureBumps(p){
+  let bump = 0.0;
+  if (p.iso != null) bump += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04);
+  if (p.barrelRate != null) bump += clamp((Number(p.barrelRate)-0.07)*0.35, -0.01, 0.05);
+  if (p.recentHRperPA != null) bump += clamp(Number(p.recentHRperPA)*0.6, 0, 0.05);
+  if (p.starterHR9 != null) bump += clamp((Number(p.starterHR9)-1.0)*0.015, -0.015, 0.03);
+  // tiny anchor list
+  const anchor = ["AARON JUDGE","SHOHEI OHTANI","YORDAN ALVAREZ","KYLE SCHWARBER","MATT OLSON","PETE ALONSO"];
+  if (anchor.includes(String(p.name||"").toUpperCase())) bump += 0.01;
+  return bump;
 }
 
-// -------- Component --------
+function computeModelProb(p){
+  // base prior
+  let prior = 0.035 + featureBumps(p);
+  prior = clamp(prior, 0.01, 0.22);
+  // blend with market if we have live odds
+  const liveA = Number.isFinite(p.oddsAmerican) ? Number(p.oddsAmerican) : (Number.isFinite(p.liveAmerican) ? Number(p.liveAmerican) : null);
+  if (liveA != null){
+    const market = probFromAmerican(liveA);
+    if (market != null){
+      let blend = 0.7*market + 0.3*prior;
+      blend = clamp(blend + 0.0, 0.01, 0.30);
+      return blend;
+    }
+  }
+  return prior;
+}
+
+function gamesSeenFromCandidates(cands){
+  const set = new Set();
+  for (const c of cands){
+    const g = c.game || ((c.away && c.home) ? `${c.away}@${c.home}` : null);
+    if (g) set.add(g);
+    else if (c.eventId) set.add(String(c.eventId));
+  }
+  return set.size;
+}
+
 export default function MLB(){
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [diag, setDiag] = useState({
     source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null,
-    slateDate:null, rr2:0, rr3:0, unitMemo:"", apiTried: [],
+    slateDate:null, rr2:0, rr3:0, unitMemo:"", apiTried: [], lateBanner:false
   });
 
   async function generate(){
@@ -179,6 +208,7 @@ export default function MLB(){
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
 
+      // fallback to odds-derived candidates if needed
       if (!cands.length && ctx.byGamePlayer.size){
         const fromOdds = Array.from(ctx.byGamePlayer.values()).map(rec => {
           const [away,home] = (rec.game||"").split("@");
@@ -187,12 +217,12 @@ export default function MLB(){
         if (fromOdds.length){ cands = fromOdds; source = "odds-props (fallback via context)"; }
       }
       if (!cands.length){
-        setDiag(d => ({ ...d, source:"(no data)", count:0, games: ctx.games.size || 0, slateDate: ctx.slateDate, apiTried: ctx.tried }));
+        setDiag(d => ({ ...d, source:"(no data)", count:0, games: ctx.games.size || 0, slateDate: ctx.slateDate, apiTried: ctx.tried, lateBanner:true }));
         setMessage("No candidates (primary and fallback empty)");
         return;
       }
 
-      // Join odds into candidates
+      // Join live odds from context
       const { byGamePlayer, byPlayer, slateDate } = ctx;
       cands = cands.map(c => {
         let oddsAmerican = c.oddsAmerican;
@@ -202,54 +232,71 @@ export default function MLB(){
         return { ...c, oddsAmerican };
       });
 
-      // Score and try selector
+      // Score and run selector
       const scored = cands.map(scoreHRPick);
       let selection = selectHRPicks(scored);
       if (!selection || !Array.isArray(selection.picks)) selection = { picks: [], message: "" };
       setMessage(selection.message || "");
 
-      // ALWAYS enrich picks (probabilities, live odds, edges) — whether selector returned things or not
-      let picks = selection.picks.length ? selection.picks : scored;
+      // Enrich picks, fallback if selector empty
+      let picks = selection.picks.length ? selection.picks : scored.slice(0, 24);
       picks = picks.map((p) => {
-        const modelProb = (p.p_final ?? p.prob ?? p.p ?? null) ?? heuristicProb(p);
-        const modelAmerican = modelProb != null ? americanFromProb(modelProb) : null;
+        const modelProb = (p.p_final ?? p.prob ?? p.p ?? null) ?? computeModelProb(p);
+        const modelAmerican = americanFromProb(modelProb);
         const liveAmerican = Number.isFinite(p.oddsAmerican) ? Math.round(p.oddsAmerican) : null;
-        let edge = null;
-        if (modelProb != null && liveAmerican != null){
-          const liveP = probFromAmerican(liveAmerican);
-          if (liveP != null){ edge = (modelProb - liveP); }
+        let whyParts = [];
+        if (liveAmerican != null){
+          const mp = probFromAmerican(liveAmerican);
+          if (mp != null) whyParts.push(`market implies ${(mp*100).toFixed(1)}% (${fmtAmerican(liveAmerican)})`);
         }
-        return { ...p, modelProb, modelAmerican, liveAmerican, edge };
+        if (p.barrelRate != null){
+          const br = Number(p.barrelRate)*100;
+          if (br >= 11) whyParts.push(`barrels ${br.toFixed(1)}%`);
+        }
+        if (p.iso != null){
+          const iso = Number(p.iso);
+          if (iso >= 0.240) whyParts.push(`ISO ${iso.toFixed(3)}`);
+        }
+        if (p.recentHRperPA != null){
+          const r = Number(p.recentHRperPA)*100;
+          if (r >= 1.5) whyParts.push(`L15 HR/PA ${r.toFixed(1)}%`);
+        }
+        if (p.starterHR9 != null){
+          const s = Number(p.starterHR9);
+          if (s >= 1.3) whyParts.push(`opp ${s.toFixed(2)} HR/9`);
+        }
+        if (p.expPA != null) whyParts.push(`~${p.expPA} PAs`);
+
+        return { ...p, modelProb, modelAmerican, liveAmerican, whyParts };
       });
 
-      // If selector was empty, limit to value-y top N; if selector had picks, keep their ordering but trim to top 12
-      if (!selection.picks.length){
-        picks = picks.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
-        picks.sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
-      }
+      // Rank by edge then prob, keep top 12
+      picks.forEach(p => {
+        const liveP = p.liveAmerican != null ? probFromAmerican(p.liveAmerican) : null;
+        p.edge = (liveP != null) ? (p.modelProb - liveP) : null;
+      });
+      picks.sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
       picks = picks.slice(0, 12);
 
       const probs = picks.map(p => p.modelProb).filter(x => Number.isFinite(x));
       const avgProb = probs.length ? (100*probs.reduce((a,b)=>a+b,0)/probs.length) : null;
       const liveOddsCount = picks.filter(p => Number.isFinite(p.liveAmerican)).length;
       const liveOddsPct = picks.length ? Math.round(100 * liveOddsCount / picks.length) : 0;
-
       const rr2 = choose(picks.length, 2);
       const rr3 = choose(picks.length, 3);
       const unitMemo = picks.length ? "Balance across anchors and values" : "";
+      const gamesSeen = ctx.games.size || gamesSeenFromCandidates(cands);
 
-      const gamesSeen = ctx.games.size || 0;
-
-      setDiag(d => ({ ...d, source, count: cands.length, games: gamesSeen, picks: picks.length, anchors: 0, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, apiTried: ctx.tried }));
+      setDiag(d => ({ ...d, source, count: cands.length, games: gamesSeen, picks: picks.length, anchors: 0, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, apiTried: ctx.tried, lateBanner: liveOddsPct < 20 }));
 
       const ui = picks.map((p) => ({
-        name: cleanName(p.name||""),
-        team: p.team||"—",
+        name: p.name || "",
+        team: p.team || "—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
         modelProb: p.modelProb,
         modelAmerican: p.modelAmerican,
         oddsAmerican: p.liveAmerican ?? p.oddsAmerican ?? null,
-        why: buildWhy(p),
+        why: `${p.name || ""}${p.game ? ` (${p.game})`: ""} — ${p.whyParts.slice(0,4).join(" • ") || "power spot."}`
       }));
       setRows(ui);
     }catch(e){
@@ -262,44 +309,8 @@ export default function MLB(){
 
   useEffect(()=>{ generate(); }, []);
 
-  function buildWhy(p){
-    const facts = [];
-    if (p.oppThrows && p.bats){ facts.push(`${p.bats.toUpperCase()} vs ${p.oppThrows.toUpperCase()} match-up`); }
-    else if (p.oppThrows){ facts.push(`faces a ${p.oppThrows.toUpperCase()}HP`); }
-    if (p.iso != null){
-      const iso = Number(p.iso);
-      if (iso >= 0.240) facts.push(`big pop (ISO ${iso.toFixed(3)})`);
-      else if (iso >= 0.190) facts.push(`solid pop (ISO ${iso.toFixed(3)})`);
-    }
-    if (p.barrelRate != null){
-      const br = Number(p.barrelRate)*100;
-      if (br >= 12) facts.push(`barrels ${br.toFixed(1)}%`);
-    }
-    if (p.recentHRperPA != null){
-      const r = Number(p.recentHRperPA)*100;
-      if (r >= 1.5) facts.push(`L15 HR/PA ${r.toFixed(1)}%`);
-    }
-    if (p.starterHR9 != null){
-      const s = Number(p.starterHR9);
-      if (s >= 1.3) facts.push(`opp allows ${s.toFixed(2)} HR/9`);
-    }
-    if (p.expPA != null) facts.push(`~${p.expPA} PAs`);
-
-    const head = cleanName(p.name||"");
-    const ctx = p.game ? ` (${p.game})` : "";
-    if (!facts.length) return `${head}${ctx} — trending power spot.`;
-    return `${head}${ctx} — ${facts.slice(0,4).join(" • ")}`;
-  }
-
   function Chip({ok, children}){
     return <span className={ok ? "inline-block px-2 py-0.5 rounded bg-green-100 text-green-800" : "inline-block px-2 py-0.5 rounded bg-red-100 text-red-800"}>{children}</span>;
-  }
-
-  function LateBanner({livePct}){
-    if (livePct == null || livePct >= 40) return null;
-    return <div className="mb-3 p-3 rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm">
-      Markets look thin (live odds on {livePct}% of picks). Late slate or provider hiccup — showing heuristic picks where needed.
-    </div>;
   }
 
   return (
@@ -319,10 +330,9 @@ export default function MLB(){
         >
           {loading ? "Generating…" : "Generate"}
         </button>
+        {diag.lateBanner ? <span className="text-xs px-2 py-1 rounded bg-yellow-100 text-yellow-800">Markets thin/closing — showing model odds; live prices may be missing</span> : null}
         {message ? <span className="text-sm text-gray-700">{message}</span> : null}
       </div>
-
-      <LateBanner livePct={diag.liveOddsPct} />
 
       {rows.length ? (
         <div className="overflow-x-auto">
@@ -368,7 +378,7 @@ export default function MLB(){
         <div><strong>Odds endpoints tried:</strong> {diag.apiTried.join(" → ") || "—"}</div>
         <div className="flex flex-wrap gap-2">
           <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
-          <Chip ok={true}>Features: enrich-picks • multi-fallback • fuzzy_match</Chip>
+          <Chip ok={true}>Features: market-blend • multi-fallback • fuzzy_match</Chip>
         </div>
       </div>
     </div>
