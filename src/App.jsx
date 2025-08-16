@@ -1,18 +1,30 @@
-\
 // src/App.jsx
-import React from "react";
+import React, { Suspense } from "react";
 import { BrowserRouter, Routes, Route, Link, Navigate } from "react-router-dom";
 import MLB from "./MLB.jsx";
 
-// If these exist in your repo, your versions will be used.
-// The stubs below only load if the files are missing.
-let NFL, Soccer, Tracking, SB2Hits, AnytimeTD, NeggCorr;
-try { NFL = (await import("./NFL.jsx")).default; } catch { NFL = () => <div className="p-6">NFL page coming back soon.</div>; }
-try { Soccer = (await import("./Soccer.jsx")).default; } catch { Soccer = () => <div className="p-6">Soccer page coming back soon.</div>; }
-try { Tracking = (await import("./Tracking.jsx")).default; } catch { Tracking = () => <div className="p-6">Tracking dashboard coming soon.</div>; }
-try { SB2Hits = (await import("./SB2Hits.jsx")).default; } catch { SB2Hits = () => <div className="p-6">2+ Hits builder coming back soon.</div>; }
-try { AnytimeTD = (await import("./AnytimeTD.jsx")).default; } catch { AnytimeTD = () => <div className="p-6">Anytime TD builder coming back soon.</div>; }
-try { NeggCorr = (await import("./NeggCorr.jsx")).default; } catch { NeggCorr = () => <div className="p-6">NeggCorr page coming back soon.</div>; }
+// Use React.lazy without top-level await.
+// If the import fails at runtime, fall back to a stub component.
+const Stub = (label) => () => <div className="p-6">{label} page coming back soon.</div>;
+
+const NFL = React.lazy(() =>
+  import("./NFL.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("NFL") }))
+);
+const Soccer = React.lazy(() =>
+  import("./Soccer.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("Soccer") }))
+);
+const Tracking = React.lazy(() =>
+  import("./Tracking.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("Tracking") }))
+);
+const SB2Hits = React.lazy(() =>
+  import("./SB2Hits.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("SB 2+ Hits") }))
+);
+const AnytimeTD = React.lazy(() =>
+  import("./AnytimeTD.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("Anytime TD") }))
+);
+const NeggCorr = React.lazy(() =>
+  import("./NeggCorr.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("NeggCorr") }))
+);
 
 function Picker(){
   const cards = [
@@ -51,17 +63,20 @@ export default function App(){
         <Link to="/negcorr">NeggCorr</Link>
         <Link to="/tracking">Tracking</Link>
       </nav>
-      <Routes>
-        <Route path="/" element={<Picker/>} />
-        <Route path="/mlb" element={<MLB/>} />
-        <Route path="/nfl" element={<NFL/>} />
-        <Route path="/soccer" element={<Soccer/>} />
-        <Route path="/sb-2hits" element={<SB2Hits/>} />
-        <Route path="/anytime-td" element={<AnytimeTD/>} />
-        <Route path="/negcorr" element={<NeggCorr/>} />
-        <Route path="/tracking" element={<Tracking/>} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+
+      <Suspense fallback={<div className="p-6">Loading…</div>}>
+        <Routes>
+          <Route path="/" element={<Picker/>} />
+          <Route path="/mlb" element={<MLB/>} />
+          <Route path="/nfl" element={<NFL/>} />
+          <Route path="/soccer" element={<Soccer/>} />
+          <Route path="/sb-2hits" element={<SB2Hits/>} />
+          <Route path="/anytime-td" element={<AnytimeTD/>} />
+          <Route path="/negcorr" element={<NeggCorr/>} />
+          <Route path="/tracking" element={<Tracking/>} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Suspense>
     </BrowserRouter>
   );
 }
