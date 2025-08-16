@@ -1,16 +1,18 @@
-# Patch: Context HR scoring + richer WHY + production-weight helper
+# Patch: realistic per-game HR% + proper EV + richer WHY (no UI edits)
 
-## Files added/updated
-- `src/models/hr_scoring.js` — exports `scoreHRPick(cand)` with contextual multipliers and varied WHY text.
-- `src/server/learn/weights.js` — exports `productionWeight(season_hr)` for training-time weighting.
+This patch updates **only**:
+- `src/models/hr_scoring.js` — returns `{ prob_pp, model_odds, why, ev_1u }` with realistic probabilities and proper EV(1u).
+- `src/server/learn/weights.js` — training-time production weighting helper.
 
-## Zero-config drop-in
-If your UI already imports `scoreHRPick` from `./models/hr_scoring.js`, this will just work.
-Otherwise, import and assign results to each row:
-```js
-import { scoreHRPick } from "./models/hr_scoring.js";
-const s = scoreHRPick(cand);
-row.prob_pp = s.prob_pp;
-row.model_odds = s.model_odds;
-row.why = s.why;
-```
+## How to apply
+1) Unzip into your project root (overwrites the two files above).
+2) Commit & deploy.
+
+If your UI already calls `scoreHRPick(cand)` for each candidate, the table will immediately show:
+- Realistic **Model HR%**
+- Correct **EV (1u)** (no longer mirrors probability)
+- Varied, human **WHY**
+
+### Notes
+- Probabilities use per-PA → per-game conversion with soft contextual multipliers and a temporary calibration shrink (0.65×) to avoid 20–30% spikes until your full calibrator is re-enabled.
+- If your candidate object includes `live_odds`, EV uses that; otherwise it falls back to the model-implied odds.
