@@ -2,6 +2,8 @@
 // src/MLB.jsx
 import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
+import { selectHRPicks } from "./models/hr_select.js";
+import { normalizePlayerName } from "./lib/common/name_map.js";
 
 function americanToProb(odds){
   if (odds == null || isNaN(odds)) return null;
@@ -13,15 +15,13 @@ function americanFromProb(p){
   if (adj >= 0.5) return -Math.round(100 * adj / (1 - adj));
   return Math.round(100 * (1 - adj) / adj);
 }
-function cleanPlayer(s){
-  return String(s||"").replace(/\./g,"").replace(/\s+/g," ").trim();
-}
+
 function normalizeCandidates(raw){
   const out = [];
   if (!raw) return out;
   const push = (obj) => {
     if (!obj) return;
-    const name = cleanPlayer(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
+    const name = normalizePlayerName(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
     const home = obj.home || obj.home_team || obj.homeTeam || obj.teamHome;
     const away = obj.away || obj.away_team || obj.awayTeam || obj.teamAway || obj.opponent;
     const eventId = obj.eventId || obj.event_id || obj.id || obj.gameId || obj.gamePk;
@@ -70,40 +70,32 @@ async function fetchPrimary(){
   }catch{ return []; }
 }
 async function fetchFallback(){
-  // very tolerant fallback from odds-props
-  const urls = [
-    '/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us',
-    '/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us',
-    '/.netlify/functions/odds-props?league=mlb&regions=us',
-  ];
-  for (const url of urls){
-    try{
-      const r = await fetch(url);
-      if(!r.ok) continue;
-      const data = await r.json();
-      const out = [];
-      for (const ev of (data?.events||[])){
-        const home = ev.home_team || ev.homeTeam || "";
-        const away = ev.away_team || ev.awayTeam || "";
-        const game = away && home ? `${String(away).trim()}@${String(home).trim()}` : (ev.id || "");
-        for (const bk of (ev.bookmakers||[])){
-          for (const mk of (bk.markets||[])){
-            const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
-            const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
-            if (!isHR) continue;
-            for (const oc of (mk.outcomes||[])){
-              const player = cleanPlayer(oc.name || oc.description || oc.participant || "");
-              const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
-              if (!player || !Number.isFinite(price)) continue;
-              out.push({ name: player, home, away, game, eventId: ev.id, oddsAmerican: price });
-            }
+  const url = '/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us';
+  try{
+    const r = await fetch(url);
+    if(!r.ok) return [];
+    const data = await r.json();
+    const out = [];
+    for (const ev of (data?.events||[])){
+      const home = ev.home_team || ev.homeTeam || "";
+      const away = ev.away_team || ev.awayTeam || "";
+      const game = away && home ? `${String(away).trim()}@${String(home).trim()}` : (ev.id || "");
+      for (const bk of (ev.bookmakers||[])){
+        for (const mk of (bk.markets||[])){
+          const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
+          const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
+          if (!isHR) continue;
+          for (const oc of (mk.outcomes||[])){
+            const player = normalizePlayerName(oc.name || oc.description || oc.participant || "");
+            const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
+            if (!player || !Number.isFinite(price)) continue;
+            out.push({ name: player, home, away, game, eventId: ev.id, oddsAmerican: price });
           }
         }
       }
-      if (out.length) return out;
-    }catch{ continue; }
-  }
-  return [];
+    }
+    return out;
+  }catch{ return []; }
 }
 async function fetchHROddsIndex(){
   try{
@@ -117,7 +109,7 @@ async function fetchHROddsIndex(){
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
             for (const oc of (mk.outcomes||[])){
-              const player = cleanPlayer(oc.name || oc.description || oc.participant || "");
+              const player = normalizePlayerName(oc.name || oc.description || oc.participant || "");
               const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
               if (!player || !Number.isFinite(price)) continue;
               const key = `${gameCode}|${player}`.toLowerCase();
@@ -162,20 +154,18 @@ export default function MLB(){
 
       const idx = await fetchHROddsIndex();
       cands = cands.map(c => {
-        const key = `${c.game}|${cleanPlayer(c.name)}`.toLowerCase();
+        const key = `${c.game}|${normalizePlayerName(c.name)}`.toLowerCase();
         const joined = idx.get(key);
         return { ...c, oddsAmerican: Number.isFinite(joined) ? joined : c.oddsAmerican };
       });
 
-      // Score
+      // Score & select (selector enforces anchors/value mix)
       const scored = cands.map(scoreHRPick);
-
-      // Simple selection: sort by p_final then by best odds
-      const sorted = scored.sort((a,b)=> (b.p_final??0)-(a.p_final??0) || Math.abs(a.modelAmerican??99999)-Math.abs(b.modelAmerican??99999));
-      const top = sorted.slice(0, 20);
-
+      const { picks, message: chooseMsg } = selectHRPicks(scored);
       setDiag({ source, count: cands.length, games: gamesSeen(cands) });
-      const ui = top.map(p => ({
+      setMessage(chooseMsg || "");
+
+      const ui = picks.map(p => ({
         name: p.name,
         team: p.team||"—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
@@ -210,7 +200,7 @@ export default function MLB(){
         >
           {loading ? "Generating…" : "Generate"}
         </button>
-        {message ? <span className="text-sm text-red-700">{message}</span> : null}
+        {message ? <span className="text-sm text-gray-700">{message}</span> : null}
       </div>
 
       {rows.length ? (
