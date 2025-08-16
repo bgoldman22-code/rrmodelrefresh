@@ -1,130 +1,153 @@
-// src/MLB.jsx — HOTFIX: blob→function fallback
-import React, { useEffect, useState } from "react";
+// src/MLB.jsx
+// UI-only patch: never calls lock_picks from the browser.
+// Renders locked picks if /picks/YYYY-MM-DD.json exists, else shows Preview.
+// Keeps your diagnostics footer minimal but useful.
 
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+import React, { useEffect, useMemo, useState } from "react";
+import { buildPreviewPicks, fetchOddsMap } from "./lib/preview_picks.js";
 
-async function tryFetchJSON(url){
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${res.status} ${url}`);
-  const ct = res.headers.get("content-type") || "";
-  const isJSON = ct.includes("application/json");
-  const body = isJSON ? await res.json() : await res.text();
-  if (!isJSON) throw new Error(`Non-JSON from ${url}: ${String(body).slice(0,80)}`);
-  return body;
+function todayYMD(){
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,"0");
+  const dd = String(d.getDate()).padStart(2,"0");
+  return `${y}-${m}-${dd}`;
 }
 
-async function ensureLocked(date){
-  const blobUrl = `/.netlify/blobs/picks/${date}.json`;
-  try {
-    return await tryFetchJSON(blobUrl);
-  } catch (e) {
-    // Fall back: call function and use its JSON body directly
-    const f = await fetch(`/.netlify/functions/lock_picks`, { method: "GET" });
-    if (!f.ok) throw new Error(`lock_picks failed: ${f.status}`);
-    const payload = await f.json().catch(()=> ({}));
-    // If the function returned the payload directly, use it; otherwise try blob once more
-    if (payload && payload.picks) return payload;
-    await new Promise(r=> setTimeout(r, 700));
-    return await tryFetchJSON(blobUrl);
+async function getLocked(date){
+  const url = `/.netlify/blobs/picks/${date}.json`;
+  const res = await fetch(url, { headers: { "cache-control":"no-cache", "accept":"application/json" } });
+  if (!res.ok) {
+    if (res.status === 404) return { locked: false, picks: [], source: "missing" };
+    return { locked: false, picks: [], source: `error ${res.status}` };
   }
+  const ct = res.headers.get("content-type")||"";
+  if (!ct.includes("application/json")) {
+    const txt = await res.text().catch(()=>"(non-text)");
+    throw new Error(`Non-JSON from ${url}: ${txt.slice(0,120)}`);
+  }
+  const payload = await res.json();
+  return { locked: true, picks: payload.picks || [], meta: payload };
 }
 
-async function getOdds(date){
-  const blobUrl = `/.netlify/blobs/odds/${date}.json`;
-  try {
-    return await tryFetchJSON(blobUrl);
-  } catch {
-    const f = await fetch(`/.netlify/functions/update_odds`, { method: "GET" });
-    // odds function returns { ok, size } normally; ignore and just try blob once more
-    await new Promise(r=> setTimeout(r, 500));
-    try { return await tryFetchJSON(blobUrl); } catch { return {}; }
-  }
+function americanFromPct(pct){
+  const p = Math.min(0.99999, Math.max(0.00001, (pct||0)/100));
+  if (p >= 0.5) return String(-Math.round(100*p/(1-p)));
+  return `+${Math.round(100*(1-p)/p)}`;
 }
 
 export default function MLB(){
   const [rows, setRows] = useState([]);
-  const [meta, setMeta] = useState({ date: todayISO(), locked_at_et: null, model_version: null });
-  const [status, setStatus] = useState({ picks: 0, oddsSize: 0, merged: 0, error: null, refreshed:false });
+  const [diag, setDiag] = useState({ mode: "waiting", date: todayYMD(), picks: 0, oddsEntries: 0, note: "" });
 
-  useEffect(()=>{
-    let mounted = true;
-    (async()=>{
-      const date = todayISO();
-      try{
-        const picks = await ensureLocked(date);
-        const odds = await getOdds(date);
-        const merged = (picks.picks||[]).map(p => ({
-          player: p.player,
-          team: p.team,
-          game: `${p.opp}@${p.team}`,
-          prob: p.prob_pp,
-          modelOdds: toAmericanFromPct(p.prob_pp),
-          liveOdds: odds[p.player] ?? "—",
-          why: (p.why||[]).join(", ")
+  useEffect(() => {
+    let cancelled = false;
+    const date = todayYMD();
+
+    async function run(){
+      try {
+        // 1) Try locked list
+        const locked = await getLocked(date);
+        if (cancelled) return;
+
+        if (locked.locked && (locked.picks?.length || 0) > 0){
+          // merge latest odds (best-effort)
+          const oddsMap = await fetchOddsMap().catch(()=> ({}));
+          if (cancelled) return;
+
+          const merged = (locked.picks || []).map(p => ({
+            ...p,
+            model_odds: americanFromPct(p.prob_pp),
+            live_odds: oddsMap[p.player] ?? "-",
+            why: Array.isArray(p.why) ? p.why.join(" • ") : (p.why || ""),
+          }));
+
+          setRows(merged);
+          setDiag({
+            mode: "locked",
+            date,
+            picks: merged.length,
+            oddsEntries: Object.keys(oddsMap||{}).length,
+            note: `Today's picks locked at ${locked?.meta?.locked_at_et || "11:00"} ET`,
+          });
+          return;
+        }
+
+        // 2) Fallback: PREVIEW
+        const [picks, oddsMap] = await Promise.all([
+          buildPreviewPicks(),
+          fetchOddsMap().catch(()=> ({})),
+        ]);
+        if (cancelled) return;
+
+        const mergedPrev = picks.map(p => ({
+          ...p,
+          model_odds: americanFromPct(p.prob_pp),
+          live_odds: oddsMap[p.player] ?? "-",
+          why: Array.isArray(p.why) ? p.why.join(" • ") : (p.why || ""),
         }));
-        if (!mounted) return;
-        setMeta({ date: picks.date, locked_at_et: picks.locked_at_et || "11:00", model_version: picks.model_version || "—" });
-        setRows(merged);
-        setStatus({ picks: merged.length, oddsSize: Object.keys(odds).length, merged: merged.length, error: null, refreshed:true });
-      }catch(e){
-        if (!mounted) return;
-        setStatus(s=>({...s, error: String(e?.message || e)}));
+
+        setRows(mergedPrev);
+        setDiag({
+          mode: "preview",
+          date,
+          picks: mergedPrev.length,
+          oddsEntries: Object.keys(oddsMap||{}).length,
+          note: "Preview — Official list will lock at 11:00 AM ET",
+        });
+      } catch (e){
+        setDiag(d => ({ ...d, note: String(e?.message || e) }));
       }
-    })();
-    return ()=>{ mounted = false; };
+    }
+
+    run();
+    return () => { cancelled = true; };
   }, []);
 
   return (
     <div className="p-4">
-      <h1 className="text-2xl font-bold">MLB — Home Run Picks</h1>
-      <div className="text-sm opacity-80 mb-3">
-        {meta.locked_at_et
-          ? <>Today’s picks locked at <b>{meta.locked_at_et} ET</b> — odds update live • Model <code>{meta.model_version}</code></>
-          : <>Waiting for today’s locked list…</>}
+      <h1 className="text-2xl font-bold mb-2">MLB — Home Run Picks</h1>
+      <div className="text-sm mb-4">
+        {diag.mode === "locked" ? (
+          <span className="px-2 py-1 rounded bg-green-100 text-green-800">Locked</span>
+        ) : (
+          <span className="px-2 py-1 rounded bg-blue-100 text-blue-800">Preview</span>
+        )}
+        <span className="ml-2 text-gray-600">{diag.note}</span>
       </div>
 
       <table className="min-w-full text-sm border">
-        <thead>
-          <tr className="bg-gray-100">
-            <th className="p-2 text-left">Player</th>
-            <th className="p-2">Team</th>
-            <th className="p-2">Game</th>
-            <th className="p-2">Model HR Prob</th>
-            <th className="p-2">Model Odds</th>
-            <th className="p-2">Live Odds</th>
-            <th className="p-2 text-left">Why</th>
+        <thead className="bg-gray-50">
+          <tr>
+            <th className="px-2 py-1 text-left">Player</th>
+            <th className="px-2 py-1 text-left">Team</th>
+            <th className="px-2 py-1 text-left">Game</th>
+            <th className="px-2 py-1 text-right">Model HR Prob</th>
+            <th className="px-2 py-1 text-right">Model Odds</th>
+            <th className="px-2 py-1 text-right">Live Odds</th>
+            <th className="px-2 py-1 text-left">Why</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((r,i)=> (
+          {rows.length === 0 ? (
+            <tr><td colSpan="7" className="px-2 py-6 text-center text-gray-500">Waiting for today’s {diag.mode === "locked" ? "locked list" : "preview"}…</td></tr>
+          ) : rows.map((r, i) => (
             <tr key={i} className="border-t">
-              <td className="p-2">{r.player}</td>
-              <td className="p-2 text-center">{r.team}</td>
-              <td className="p-2 text-center">{r.game}</td>
-              <td className="p-2 text-center">{fmtPct(r.prob)}</td>
-              <td className="p-2 text-center">{toAmericanFromPct(r.prob)}</td>
-              <td className="p-2 text-center">{r.liveOdds}</td>
-              <td className="p-2">{r.why}</td>
+              <td className="px-2 py-1">{r.player}</td>
+              <td className="px-2 py-1">{r.team || "—"}</td>
+              <td className="px-2 py-1">{r.opp ? `AWY@HOM` : (r.game || "—")}</td>
+              <td className="px-2 py-1 text-right">{(r.prob_pp ?? 0).toFixed(1)}%</td>
+              <td className="px-2 py-1 text-right">{r.model_odds}</td>
+              <td className="px-2 py-1 text-right">{r.live_odds}</td>
+              <td className="px-2 py-1">{r.why || ""}</td>
             </tr>
           ))}
         </tbody>
       </table>
 
-      <div className="mt-4 text-sm">
-        <b>Diagnostics:</b> Picks: {status.picks} • Live odds entries: {status.oddsSize} {status.refreshed ? "• (auto-refreshed)" : ""}
-        {status.error && <div className="text-red-600 mt-1">Error: {status.error}</div>}
+      <div className="mt-3 text-xs text-gray-600">
+        Diagnostics: Picks: {diag.picks} • Live odds entries: {diag.oddsEntries}
       </div>
     </div>
   );
-}
-
-function fmtPct(x){
-  if (x==null || !Number.isFinite(+x)) return "—";
-  const p = (+x).toFixed(1);
-  return `${p}%`;
-}
-function toAmericanFromPct(pp){
-  const p = Math.min(99.999, Math.max(0.001, Number(pp||0))) / 100;
-  if (p >= 0.5) return -Math.round(100 * p / (1-p));
-  return `+${Math.round(100 * (1-p) / p)}`;
 }
