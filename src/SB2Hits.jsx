@@ -1,0 +1,1 @@
+export default function SB2Hits(){ return <div className="p-6"><h1 className="text-xl font-bold">SB 2+ Hits</h1><p>Coming back soon.</p></div>; }

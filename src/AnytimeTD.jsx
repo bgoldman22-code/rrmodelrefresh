@@ -1,0 +1,1 @@
+export default function AnytimeTD(){ return <div className="p-6"><h1 className="text-xl font-bold">Anytime TD</h1><p>Coming back soon.</p></div>; }

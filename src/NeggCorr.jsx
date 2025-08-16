@@ -1,0 +1,1 @@
+export default function NeggCorr(){ return <div className="p-6"><h1 className="text-xl font-bold">NeggCorr</h1><p>Coming back soon.</p></div>; }

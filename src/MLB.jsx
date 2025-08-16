@@ -20,6 +20,11 @@ function uniqGames(cands){
   }
   return set.size;
 }
+// Strip invisible Unicode that sometimes sneaks in from feeds/serialization
+function cleanName(name){
+  if (!name) return "";
+  return String(name).replace(/[\\u200B-\\u200D\\u2060]/g, "");
+}
 
 // DO NOT transform names; only trim whitespace
 function normalizeCandidates(raw){
@@ -156,7 +161,6 @@ export default function MLB(){
       const { picks, message: chooseMsg } = selectHRPicks(scored);
       setMessage(chooseMsg || "");
 
-      // Stats for footer
       const anchorsSet = new Set(["Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge","Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager","Marcell Ozuna","Kyle Tucker","Rafael Devers"]);
       const anchors = picks.filter(p => anchorsSet.has(String(p.name))).length;
       const probs = picks.map(p => p.p_final).filter(Number.isFinite);
@@ -166,19 +170,15 @@ export default function MLB(){
 
       setDiag({ source, count: cands.length, games: uniqGames(cands), picks: picks.length, anchors, avgProb, liveOddsPct });
 
-      const ui = picks.map((p) => {
-        // protect first letter (handles accidental ::first-letter CSS)
-        const safeName = "\\u2060" + String(p.name||"");
-        return {
-          name: safeName,
-          team: p.team||"—",
-          game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
-          modelProb: p.p_final ?? null,
-          modelAmerican: p.modelAmerican ?? (p.p_final ? americanFromProb(p.p_final) : null),
-          oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
-          why: p.why2 || p.why || "—",
-        };
-      });
+      const ui = picks.map((p) => ({
+        name: cleanName(p.name||""),
+        team: p.team||"—",
+        game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
+        modelProb: p.p_final ?? null,
+        modelAmerican: p.modelAmerican ?? (p.p_final ? americanFromProb(p.p_final) : null),
+        oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
+        why: p.why2 || p.why || "—",
+      }));
       setRows(ui);
 
       // fire-and-forget daily log
@@ -268,7 +268,7 @@ export default function MLB(){
         <div className="text-gray-500">No picks yet.</div>
       )}
 
-      {/* Footer diagnostics (restored) */}
+      {/* Footer diagnostics */}
       <div className="mt-6 text-sm text-gray-700 space-y-1">
         <div><strong>Diagnostics:</strong></div>
         <div>• Picks shown: {diag.picks} (anchors: {diag.anchors})</div>
