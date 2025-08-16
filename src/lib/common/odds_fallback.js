@@ -1,29 +1,13 @@
 // src/lib/common/odds_fallback.js
-// Hardened fallback: tries multiple odds-props URL shapes and multiple market key spellings.
-// Returns { candidates, sourceTried, counts, tried } for diagnostics.
-
-function cleanName(s){
-  return String(s||"").replace(/\./g,"").replace(/\s+/g," ").trim();
-}
-
+function cleanName(s){ return String(s||"").replace(/\./g,"").replace(/\s+/g," ").trim(); }
 function isHRMarketKey(key){
   if (!key) return false;
   const k = String(key).toLowerCase();
-  const known = [
-    "player_home_runs",
-    "player to hit a home run",
-    "player_to_hit_a_home_run",
-    "to hit a home run",
-    "home run",
-    "home runs"
-  ];
+  const known = ["player_home_runs","player to hit a home run","player_to_hit_a_home_run","to hit a home run","home run","home runs"];
   if (known.some(x => k.includes(x))) return true;
-  // loose: contains both 'home' and 'run'
   return (k.includes("home") && k.includes("run"));
 }
-
 function extractAmerican(oc){
-  // supports price_american, price.american, american, odds (as +/- int), etc.
   const p = oc?.price_american ?? oc?.price?.american ?? oc?.american ?? oc?.odds ?? null;
   if (p == null) return null;
   const num = Number(p);
@@ -32,7 +16,6 @@ function extractAmerican(oc){
   const n2 = Number(str);
   return Number.isFinite(n2) ? Math.round(n2) : null;
 }
-
 export async function buildCandidatesFromOddsPropsHardened(){
   const urls = [
     '/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us',
@@ -60,29 +43,18 @@ export async function buildCandidatesFromOddsPropsHardened(){
             if (!isHRMarketKey(key)) continue;
             marketsSeen++;
             for (const oc of (mk.outcomes||[])){
-              // some books encode "Yes/No" for HR markets; prefer "Yes"
               const rawName = oc?.name || oc?.description || oc?.participant || "";
               const price = extractAmerican(oc);
               if (!Number.isFinite(price)) continue;
-              // If market is Yes/No, only take "Yes"
               const isYesNo = typeof rawName === "string" && (rawName.toLowerCase() === "yes" || rawName.toLowerCase() === "no");
               if (isYesNo && rawName.toLowerCase() !== "yes") continue;
-
-              // Try to find player name field if oc.name is "Yes"
               let player = rawName;
               if (isYesNo){
                 player = oc?.player || oc?.participant || oc?.runner || oc?.description || oc?.label || "";
               }
               player = cleanName(player);
               if (!player) continue;
-
-              candidates.push({
-                name: player,
-                team: "",
-                home, away, game,
-                eventId: ev.id || ev.commence_time || "",
-                oddsAmerican: price
-              });
+              candidates.push({ name: player, team: "", home, away, game, eventId: ev.id || ev.commence_time || "", oddsAmerican: price });
               outcomesSeen++;
             }
           }

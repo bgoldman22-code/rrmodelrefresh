@@ -1,4 +1,4 @@
-// src/MLB.jsx (wired to hardened fallback)
+// src/MLB.jsx (shows tried-URL statuses if fallback yields 0)
 import React, { useEffect, useState } from "react";
 import { selectHRPicks } from "./models/hr_select.js";
 import { scoreHRPick } from "./models/hr_scoring.js";
@@ -113,25 +113,23 @@ export default function MLB(){
   async function generate(){
     setLoading(true); setMessage(""); setPicks([]);
     try{
-      // 1) Primary: get candidates from your Netlify function
       const baseRes = await fetch('/.netlify/functions/odds-mlb-hr');
-      // if HTTP error, don't throw yet — we still want fallback
       const baseJson = baseRes.ok ? await baseRes.json() : null;
       let cands = normalizeCandidates(baseJson);
       let dataSource = '/.netlify/functions/odds-mlb-hr';
 
-      // 1b) Fallback: if zero, build from odds-props (hardened)
       if (!cands.length) {
         const fb = await buildCandidatesFromOddsPropsHardened();
         if (fb.candidates?.length) {
           cands = fb.candidates;
           dataSource = `odds-props fallback (${fb.sourceTried||"no-source"})`;
           console.info("Fallback diagnostics:", fb);
+        } else {
+          const detail = (fb.tried||[]).map(t => `${t.url}→${t.status}`).join(" | ");
+          throw new Error(`No candidates: primary empty and fallback parsed 0. Tried: ${detail || "no attempts"}`);
         }
       }
-      if (!cands.length) throw new Error('No candidates (primary empty and fallback parsed 0 from all URLs).');
 
-      // 2) Join live HR odds (best seen)
       const idx = await fetchHROddsIndex();
       cands = cands.map(c => {
         const key = `${c.game}|${c.name}`.toLowerCase();
@@ -139,13 +137,11 @@ export default function MLB(){
         return { ...c, oddsAmerican: Number.isFinite(joined) ? joined : c.oddsAmerican };
       });
 
-      // 3) Score and select
       const scored = cands.map(scoreHRPick);
       const { picks: chosen, message: chooseMsg } = selectHRPicks(scored);
       setDiag({ source: dataSource, count: cands.length, games: gamesSeen(cands) });
       setMessage(chooseMsg || "");
 
-      // 4) Shape for UI
       const ui = chosen.map(p => ({
         name: p.name,
         team: p.team,
