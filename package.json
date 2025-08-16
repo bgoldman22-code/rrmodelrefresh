@@ -5,20 +5,21 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/sanitize-mlb.js && node -v && npm -v && node -e \"const fs=require('fs');const s=fs.readFileSync('src/MLB.jsx','utf8').split(/\\r?\\n/).slice(0,3).join('\\n');console.log('[HEAD OF MLB.jsx]\\n'+s);\"",
     "build": "vite build",
     "preview": "vite preview --port 4173"
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.2",
     "@netlify/blobs": "^7.4.0",
     "bcrypt": "npm:bcryptjs@^2.4.3",
-    "bcryptjs": "^2.4.3"
+    "bcryptjs": "^2.4.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
   },
   "devDependencies": {
-    "vite": "^5.4.19",
-    "@vitejs/plugin-react": "^4.3.2"
+    "@vitejs/plugin-react": "^4.3.2",
+    "vite": "^5.4.19"
   },
   "overrides": {
     "bcrypt": "npm:bcryptjs@^2.4.3"
