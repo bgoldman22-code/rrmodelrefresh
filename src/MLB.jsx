@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-odds-blend-no-nameclean";
+const MODEL_VERSION = "1.4.3-hotfix-odds-diagnostics";
 
 function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
 function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
@@ -75,7 +75,6 @@ async function fetchPrimary(){
   try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
 async function fetchOddsContext(){
-  const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set(), tried: [] };
   const urls = [
     "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
     "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
@@ -87,13 +86,36 @@ async function fetchOddsContext(){
   const games = new Set();
   let earliest = null;
   const tried = [];
+  const rawSnapshots = []; // for diagnostics
+
   for (const url of urls){
     tried.push(url);
     try{
       const r = await fetch(url);
       if (!r.ok) continue;
       const data = await r.json();
+      // Keep a compact snapshot (first 10 outcomes) for diagnostics
+      const snap = [];
       for (const ev of (data?.events||[])){
+        const evSnap = { id: ev.id, home: ev.home_team||ev.homeTeam, away: ev.away_team||ev.awayTeam, markets: 0, sample: [] };
+        for (const bk of (ev.bookmakers||[])){
+          for (const mk of (bk.markets||[])){
+            const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
+            const texty = (mk.key_name || mk.market || mk.key || "").toLowerCase();
+            const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run") || texty.includes("home run");
+            if (!isHR) continue;
+            evSnap.markets++;
+            for (const oc of (mk.outcomes||[])){
+              if (evSnap.sample.length >= 10) break;
+              evSnap.sample.push({
+                name: oc.name || oc.description || oc.participant || "",
+                price: oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds
+              });
+            }
+          }
+        }
+        if (evSnap.sample.length) snap.push(evSnap);
+        // also build our join maps
         const home = ev.home_team || ev.homeTeam || "";
         const away = ev.away_team || ev.awayTeam || "";
         const game = away && home ? `${clean(away)}@${clean(home)}` : (ev.id || "");
@@ -127,11 +149,12 @@ async function fetchOddsContext(){
           }
         }
       }
-    }catch{/* keep trying next */}
+      rawSnapshots.push({ url, sample: snap.slice(0, 5) });
+    }catch{/* continue */}
     if (byGamePlayer.size) break;
   }
   const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
-  return { byGamePlayer, byPlayer, slateDate, games, tried };
+  return { byGamePlayer, byPlayer, slateDate, games, tried, rawSnapshots };
 }
 
 function fuzzyLookup(name, game, byGamePlayer, byPlayer){
@@ -159,17 +182,14 @@ function featureBumps(p){
   if (p.barrelRate != null) bump += clamp((Number(p.barrelRate)-0.07)*0.35, -0.01, 0.05);
   if (p.recentHRperPA != null) bump += clamp(Number(p.recentHRperPA)*0.6, 0, 0.05);
   if (p.starterHR9 != null) bump += clamp((Number(p.starterHR9)-1.0)*0.015, -0.015, 0.03);
-  // tiny anchor list
   const anchor = ["AARON JUDGE","SHOHEI OHTANI","YORDAN ALVAREZ","KYLE SCHWARBER","MATT OLSON","PETE ALONSO"];
   if (anchor.includes(String(p.name||"").toUpperCase())) bump += 0.01;
   return bump;
 }
 
 function computeModelProb(p){
-  // base prior
   let prior = 0.035 + featureBumps(p);
   prior = clamp(prior, 0.01, 0.22);
-  // blend with market if we have live odds
   const liveA = Number.isFinite(p.oddsAmerican) ? Number(p.oddsAmerican) : (Number.isFinite(p.liveAmerican) ? Number(p.liveAmerican) : null);
   if (liveA != null){
     const market = probFromAmerican(liveA);
@@ -200,15 +220,18 @@ export default function MLB(){
     source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null,
     slateDate:null, rr2:0, rr3:0, unitMemo:"", apiTried: [], lateBanner:false
   });
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [rawOdds, setRawOdds] = useState([]); // diagnostics snapshots
 
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
     try{
       const ctx = await fetchOddsContext();
+      setRawOdds(ctx.rawSnapshots || []); // capture diagnostics
+
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
 
-      // fallback to odds-derived candidates if needed
       if (!cands.length && ctx.byGamePlayer.size){
         const fromOdds = Array.from(ctx.byGamePlayer.values()).map(rec => {
           const [away,home] = (rec.game||"").split("@");
@@ -222,7 +245,6 @@ export default function MLB(){
         return;
       }
 
-      // Join live odds from context
       const { byGamePlayer, byPlayer, slateDate } = ctx;
       cands = cands.map(c => {
         let oddsAmerican = c.oddsAmerican;
@@ -232,13 +254,11 @@ export default function MLB(){
         return { ...c, oddsAmerican };
       });
 
-      // Score and run selector
       const scored = cands.map(scoreHRPick);
       let selection = selectHRPicks(scored);
       if (!selection || !Array.isArray(selection.picks)) selection = { picks: [], message: "" };
       setMessage(selection.message || "");
 
-      // Enrich picks, fallback if selector empty
       let picks = selection.picks.length ? selection.picks : scored.slice(0, 24);
       picks = picks.map((p) => {
         const modelProb = (p.p_final ?? p.prob ?? p.p ?? null) ?? computeModelProb(p);
@@ -270,7 +290,6 @@ export default function MLB(){
         return { ...p, modelProb, modelAmerican, liveAmerican, whyParts };
       });
 
-      // Rank by edge then prob, keep top 12
       picks.forEach(p => {
         const liveP = p.liveAmerican != null ? probFromAmerican(p.liveAmerican) : null;
         p.edge = (liveP != null) ? (p.modelProb - liveP) : null;
@@ -330,6 +349,12 @@ export default function MLB(){
         >
           {loading ? "Generating…" : "Generate"}
         </button>
+        <button
+          className="px-3 py-2 bg-gray-200 text-gray-800 rounded hover:bg-gray-300"
+          onClick={()=>setDebugOpen(v=>!v)}
+        >
+          {debugOpen ? "Hide raw odds" : "Show raw odds"}
+        </button>
         {diag.lateBanner ? <span className="text-xs px-2 py-1 rounded bg-yellow-100 text-yellow-800">Markets thin/closing — showing model odds; live prices may be missing</span> : null}
         {message ? <span className="text-sm text-gray-700">{message}</span> : null}
       </div>
@@ -378,9 +403,27 @@ export default function MLB(){
         <div><strong>Odds endpoints tried:</strong> {diag.apiTried.join(" → ") || "—"}</div>
         <div className="flex flex-wrap gap-2">
           <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
-          <Chip ok={true}>Features: market-blend • multi-fallback • fuzzy_match</Chip>
+          <Chip ok={true}>Features: market-blend • multi-fallback • fuzzy_match • odds-diagnostics</Chip>
         </div>
       </div>
+
+      {debugOpen && (
+        <div className="mt-6 p-4 bg-gray-900 text-gray-100 rounded">
+          <div className="font-semibold mb-2">Raw odds (first few per endpoint)</div>
+          {rawOdds.length === 0 ? (
+            <div className="text-sm opacity-80">No odds snapshots captured.</div>
+          ) : (
+            <div className="space-y-4 text-xs">
+              {rawOdds.map((blk, i)=>(
+                <div key={i}>
+                  <div className="mb-1 underline break-all">{blk.url}</div>
+                  <pre className="whitespace-pre-wrap">{JSON.stringify(blk.sample, null, 2)}</pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
