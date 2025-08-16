@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { impliedFromAmerican, evFromProbAndOdds } from "./utils/ev.js";
+import { americanFromProb, impliedFromAmerican, evFromProbAndOdds } from "./utils/ev.js";
 import { hotColdMultiplier } from "./utils/hotcold.js";
 import { normName, buildWhy } from "./utils/why.js";
 
