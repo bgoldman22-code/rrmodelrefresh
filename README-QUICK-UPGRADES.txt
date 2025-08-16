@@ -49,3 +49,27 @@ SAFETY
 - These changes do not alter your model logic, API calls, or odds.
 - If you don't import them, nothing changes.
 - Start with SlateBadge (visual only), then add ensureMinPicks, then SavePicks button.
+
+## OddsAPI + Why upgrade (Aug 16, 2025)
+
+- New robust odds fetcher: `netlify/functions/odds-props.mjs`
+  - Discovers the correct market key via `/odds-markets`
+  - Fetches `player_home_runs` odds and exposes rows with { player, price, bookmaker, eventId }
+  - Emits quota headers in JSON
+
+- Diagnostics endpoint: `netlify/functions/odds-diagnostics.mjs`
+  - Verifies env presence, markets availability, and sample outcome count
+
+- Why builder util: `src/utils/why.js`
+  - `buildWhy()` composes a readable explanation string including model %, market price & edge, pitcher/park/weather (if available), hot/cold, lineup slot
+  - `normName()` to join odds rows to your candidates
+
+- Sanity script: `scripts/sanity-odds.sh`
+  - Run against local dev server: `scripts/sanity-odds.sh http://localhost:8888`
+  - Or deploy preview URL
+
+### Integration tips
+
+- Join odds to candidates by `normName(player)` on both sides.
+- After join, compute: `impliedFromOdds = impliedFromAmerican(price)`, `edgePctPts = modelHR - impliedFromOdds`.
+- Pass those values into `buildWhy({ ... })` for each row; if price is missing, it will include `no odds` automatically.
