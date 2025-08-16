@@ -3,17 +3,26 @@
 import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
-import { normalizePlayerName } from "./lib/common/name_map.js";
+import { normalizePlayerName } from "./src/lib/common/name_map.js"; // tolerate both paths
+import { normalizePlayerName as _np } from "./lib/common/name_map.js"; // fallback for existing structure
+const normalize = (s)=>{
+  try{ return normalizePlayerName(s); }catch{ try{ return _np(s);}catch{return s||"";} }
+};
 
-function americanToProb(odds){
-  if (odds == null || isNaN(odds)) return null;
-  const o = Number(odds);
-  return o > 0 ? (100 / (o + 100)) : (Math.abs(o) / (Math.abs(o) + 100));
-}
 function americanFromProb(p){
-  const adj = Math.max(0.001, Math.min(0.999, p));
-  if (adj >= 0.5) return -Math.round(100 * adj / (1 - adj));
-  return Math.round(100 * (1 - adj) / adj);
+  const x = Math.max(1e-6, Math.min(0.999999, Number(p)||0));
+  if (x >= 0.5) return -Math.round(100 * x / (1-x));
+  return Math.round(100 * (1-x) / x);
+}
+function uniqGames(cands){
+  const set = new Set();
+  for (const c of cands){
+    const home = c.home || c.home_team || c.homeTeam;
+    const away = c.away || c.away_team || c.awayTeam || c.opponent;
+    const g = c.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : null);
+    if (g) set.add(g);
+  }
+  return set.size;
 }
 
 function normalizeCandidates(raw){
@@ -21,27 +30,24 @@ function normalizeCandidates(raw){
   if (!raw) return out;
   const push = (obj) => {
     if (!obj) return;
-    const name = normalizePlayerName(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
+    const name = normalize(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
     const home = obj.home || obj.home_team || obj.homeTeam || obj.teamHome;
     const away = obj.away || obj.away_team || obj.awayTeam || obj.teamAway || obj.opponent;
-    const eventId = obj.eventId || obj.event_id || obj.id || obj.gameId || obj.gamePk;
-    const game = obj.game || obj.gameId || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
-    const team = obj.team || obj.playerTeam || obj.team_abbr || obj.teamAbbr || "";
+    const game = obj.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
     const odds = obj.oddsAmerican ?? obj.odds ?? obj.price ?? obj.american ?? null;
-    const impliedProb = obj.impliedProb ?? americanToProb(odds);
     out.push({
       id: obj.id || obj.playerId || `${name}|${game}`,
-      name, team, opponent: (team && home && team===home) ? away : home,
-      home, away, game, eventId,
-      oddsAmerican: (odds != null ? Number(odds) : null),
-      impliedProb,
+      name, team: obj.team || obj.playerTeam || obj.team_abbr || obj.teamAbbr || "—",
+      home, away, game,
+      eventId: obj.eventId || obj.event_id || obj.id || obj.gameId || obj.gamePk,
+      oddsAmerican: Number.isFinite(Number(odds)) ? Number(odds) : null,
       expPA: obj.expPA ?? obj.pa ?? 4,
       venue: obj.venue || obj.park || obj.venueName || obj.venue_name || null,
       starterHR9: obj.starterHR9 ?? obj.pitcherHR9 ?? obj.oppStarterHR9 ?? null,
       bvpHR: obj.bvpHR ?? obj.bvp_hr ?? 0, bvpPA: obj.bvpPA ?? obj.bvp_pa ?? 0,
       iso: obj.iso ?? obj.ISO ?? obj.seasonISO ?? obj.season_iso ?? null,
       barrelRate: obj.barrelRate ?? obj.barrel_rate ?? obj.brls_pa ?? obj.barrels_per_pa ?? null,
-      recentHRperPA: obj.recentHRperPA ?? obj.hr_per_pa_l15 ?? obj.l15_hr_pa ?? 0,
+      recentHRperPA: obj.recentHRperPA ?? obj.hr_per_pa_l15 ?? obj.l15_hr_pa ?? null,
       bats: obj.bats || obj.batterHand || obj.handedBat || null,
       oppThrows: obj.oppThrows || obj.pitcherThrows || obj.starterThrows || null,
       iso_vs_rhp: obj.iso_vs_rhp || obj.iso_v_r || obj.iso_vr || null,
@@ -86,7 +92,7 @@ async function fetchFallback(){
           const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
           if (!isHR) continue;
           for (const oc of (mk.outcomes||[])){
-            const player = normalizePlayerName(oc.name || oc.description || oc.participant || "");
+            const player = normalize(oc.name || oc.description || oc.participant || "");
             const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
             if (!player || !Number.isFinite(price)) continue;
             out.push({ name: player, home, away, game, eventId: ev.id, oddsAmerican: price });
@@ -109,7 +115,7 @@ async function fetchHROddsIndex(){
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
             for (const oc of (mk.outcomes||[])){
-              const player = normalizePlayerName(oc.name || oc.description || oc.participant || "");
+              const player = normalize(oc.name || oc.description || oc.participant || "");
               const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
               if (!player || !Number.isFinite(price)) continue;
               const key = `${gameCode}|${player}`.toLowerCase();
@@ -123,19 +129,7 @@ async function fetchHROddsIndex(){
   }catch{ return new Map(); }
 }
 
-function gamesSeen(cands){
-  const set = new Set();
-  for (const x of cands){
-    const home = x.home || x.home_team || x.homeTeam;
-    const away = x.away || x.away_team || x.awayTeam || x.opponent;
-    const game = x.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
-    const key = (x.eventId || x.event_id || x.gameId) ? `${game}#${x.eventId || x.event_id || x.gameId}` : game;
-    set.add(key);
-  }
-  return set.size;
-}
-
-function MLB(){
+export default function MLB(){
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -152,26 +146,28 @@ function MLB(){
       }
       if (!cands.length) throw new Error("No candidates (primary and fallback empty)");
 
+      // Join live odds when available
       const idx = await fetchHROddsIndex();
       cands = cands.map(c => {
-        const key = `${c.game}|${normalizePlayerName(c.name)}`.toLowerCase();
+        const key = `${c.game}|${normalize(c.name)}`.toLowerCase();
         const joined = idx.get(key);
         return { ...c, oddsAmerican: Number.isFinite(joined) ? joined : c.oddsAmerican };
       });
 
+      // Score & select
       const scored = cands.map(scoreHRPick);
       const { picks, message: chooseMsg } = selectHRPicks(scored);
-      setDiag({ source, count: cands.length, games: gamesSeen(cands) });
+      setDiag({ source, count: cands.length, games: uniqGames(cands) });
       setMessage(chooseMsg || "");
 
-      const ui = picks.map(p => ({
+      const ui = picks.map((p) => ({
         name: p.name,
         team: p.team||"—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
         modelProb: p.p_final ?? null,
         modelAmerican: p.modelAmerican ?? (p.p_final ? americanFromProb(p.p_final) : null),
         oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
-        why: p.why2 || "—",
+        why: p.why2 || p.why || "—",
       }));
       setRows(ui);
     }catch(e){
@@ -237,5 +233,3 @@ function MLB(){
     </div>
   );
 }
-
-export default MLB;

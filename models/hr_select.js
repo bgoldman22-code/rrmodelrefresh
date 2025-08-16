@@ -12,8 +12,7 @@ function keyGame(x){
   const home = x.home || x.home_team || x.homeTeam;
   const away = x.away || x.away_team || x.awayTeam || x.opponent;
   const game = x.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
-  const eventId = x.eventId || x.event_id || x.gameId || "";
-  return eventId ? `${game}#${eventId}` : game;
+  return game;
 }
 
 export function selectHRPicks(scored){
