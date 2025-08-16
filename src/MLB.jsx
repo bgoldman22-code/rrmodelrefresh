@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-picks-fallback-and-nav";
+const MODEL_VERSION = "1.4.3-hotfix-enrich-picks";
 
 function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
 function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
@@ -76,7 +76,6 @@ async function fetchPrimary(){
   try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
 async function fetchOddsContext(){
-  const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set(), tried: [] };
   const urls = [
     "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
     "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
@@ -127,7 +126,7 @@ async function fetchOddsContext(){
           }
         }
       }
-    }catch{/* keep trying next */}
+    }catch{/* try next */}
     if (byGamePlayer.size) break;
   }
   const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
@@ -163,17 +162,7 @@ function heuristicProb(p){
   return prob;
 }
 
-function gamesSeenFromCandidates(cands){
-  const set = new Set();
-  for (const c of cands){
-    const g = c.game || ((c.away && c.home) ? `${c.away}@${c.home}` : null);
-    if (g) set.add(g);
-    else if (c.eventId) set.add(String(c.eventId));
-  }
-  return set.size;
-}
-
-// ---------- component ----------
+// -------- Component --------
 export default function MLB(){
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
@@ -190,7 +179,6 @@ export default function MLB(){
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
 
-      // If primary empty, build from odds endpoints
       if (!cands.length && ctx.byGamePlayer.size){
         const fromOdds = Array.from(ctx.byGamePlayer.values()).map(rec => {
           const [away,home] = (rec.game||"").split("@");
@@ -204,7 +192,7 @@ export default function MLB(){
         return;
       }
 
-      // Join live odds
+      // Join odds into candidates
       const { byGamePlayer, byPlayer, slateDate } = ctx;
       cands = cands.map(c => {
         let oddsAmerican = c.oddsAmerican;
@@ -214,45 +202,43 @@ export default function MLB(){
         return { ...c, oddsAmerican };
       });
 
-      // Score and try the model's selector
+      // Score and try selector
       const scored = cands.map(scoreHRPick);
       let selection = selectHRPicks(scored);
       if (!selection || !Array.isArray(selection.picks)) selection = { picks: [], message: "" };
       setMessage(selection.message || "");
 
-      // Fallback: if selector returns 0, do a simple value-based pick so the table isn't empty
-      let picks = selection.picks;
-      if (!picks.length){
-        picks = scored.map((p) => {
-          let modelProb = (p.p_final ?? p.prob ?? p.p ?? null);
-          if (modelProb == null) modelProb = heuristicProb(p);
-          const modelAmerican = modelProb != null ? americanFromProb(modelProb) : null;
-          const liveAmerican = Number.isFinite(p.oddsAmerican) ? Math.round(p.oddsAmerican) : null;
-          let edge = null;
-          if (modelProb != null && liveAmerican != null){
-            const liveP = probFromAmerican(liveAmerican);
-            if (liveP != null){ edge = (modelProb - liveP); }
-          }
-          return { ...p, modelProb, modelAmerican, liveAmerican, edge };
-        });
-        // keep ones with odds or decent prob
-        picks = picks.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
-        // sort by edge then prob
-        picks.sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
-        picks = picks.slice(0, 12);
-      }
+      // ALWAYS enrich picks (probabilities, live odds, edges) — whether selector returned things or not
+      let picks = selection.picks.length ? selection.picks : scored;
+      picks = picks.map((p) => {
+        const modelProb = (p.p_final ?? p.prob ?? p.p ?? null) ?? heuristicProb(p);
+        const modelAmerican = modelProb != null ? americanFromProb(modelProb) : null;
+        const liveAmerican = Number.isFinite(p.oddsAmerican) ? Math.round(p.oddsAmerican) : null;
+        let edge = null;
+        if (modelProb != null && liveAmerican != null){
+          const liveP = probFromAmerican(liveAmerican);
+          if (liveP != null){ edge = (modelProb - liveP); }
+        }
+        return { ...p, modelProb, modelAmerican, liveAmerican, edge };
+      });
 
-      // Build rows
-      const probs = picks.map(p => p.modelProb ?? (p.p_final ?? p.prob ?? p.p ?? null)).filter(x => Number.isFinite(x));
+      // If selector was empty, limit to value-y top N; if selector had picks, keep their ordering but trim to top 12
+      if (!selection.picks.length){
+        picks = picks.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
+        picks.sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
+      }
+      picks = picks.slice(0, 12);
+
+      const probs = picks.map(p => p.modelProb).filter(x => Number.isFinite(x));
       const avgProb = probs.length ? (100*probs.reduce((a,b)=>a+b,0)/probs.length) : null;
-      const liveOddsCount = picks.filter(p => Number.isFinite(p.oddsAmerican)).length;
+      const liveOddsCount = picks.filter(p => Number.isFinite(p.liveAmerican)).length;
       const liveOddsPct = picks.length ? Math.round(100 * liveOddsCount / picks.length) : 0;
 
       const rr2 = choose(picks.length, 2);
       const rr3 = choose(picks.length, 3);
-      const unitMemo = `${picks.length ? "Balance across anchors and values" : ""}`;
+      const unitMemo = picks.length ? "Balance across anchors and values" : "";
 
-      const gamesSeen = ctx.games.size || gamesSeenFromCandidates(cands);
+      const gamesSeen = ctx.games.size || 0;
 
       setDiag(d => ({ ...d, source, count: cands.length, games: gamesSeen, picks: picks.length, anchors: 0, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, apiTried: ctx.tried }));
 
@@ -260,8 +246,8 @@ export default function MLB(){
         name: cleanName(p.name||""),
         team: p.team||"—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
-        modelProb: p.modelProb ?? (p.p_final ?? p.prob ?? p.p ?? null),
-        modelAmerican: (p.modelProb != null ? americanFromProb(p.modelProb) : (p.p_final ?? p.prob ?? p.p ? americanFromProb(p.p_final ?? p.prob ?? p.p) : null)),
+        modelProb: p.modelProb,
+        modelAmerican: p.modelAmerican,
         oddsAmerican: p.liveAmerican ?? p.oddsAmerican ?? null,
         why: buildWhy(p),
       }));
@@ -309,6 +295,13 @@ export default function MLB(){
     return <span className={ok ? "inline-block px-2 py-0.5 rounded bg-green-100 text-green-800" : "inline-block px-2 py-0.5 rounded bg-red-100 text-red-800"}>{children}</span>;
   }
 
+  function LateBanner({livePct}){
+    if (livePct == null || livePct >= 40) return null;
+    return <div className="mb-3 p-3 rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm">
+      Markets look thin (live odds on {livePct}% of picks). Late slate or provider hiccup — showing heuristic picks where needed.
+    </div>;
+  }
+
   return (
     <div className="p-6">
       <h1 className="text-2xl font-bold mb-2">
@@ -328,6 +321,8 @@ export default function MLB(){
         </button>
         {message ? <span className="text-sm text-gray-700">{message}</span> : null}
       </div>
+
+      <LateBanner livePct={diag.liveOddsPct} />
 
       {rows.length ? (
         <div className="overflow-x-auto">
@@ -373,7 +368,7 @@ export default function MLB(){
         <div><strong>Odds endpoints tried:</strong> {diag.apiTried.join(" → ") || "—"}</div>
         <div className="flex flex-wrap gap-2">
           <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
-          <Chip ok={true}>Features: picks-fallback • multi-fallback • fuzzy_match</Chip>
+          <Chip ok={true}>Features: enrich-picks • multi-fallback • fuzzy_match</Chip>
         </div>
       </div>
     </div>
