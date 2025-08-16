@@ -1,8 +1,9 @@
-\
-/* src/MLB.jsx */
+// src/MLB.jsx
 import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
+
+const MODEL_VERSION = "1.4.3-hotfix-fuzzy-rr+status";
 
 // ---------- helpers ----------
 function americanFromProb(p){
@@ -153,11 +154,11 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   const last = parts[parts.length-1] || "";
   const firstInit = (parts[0] || "").slice(0,1);
 
-  let best = null;
   // First try player-only exact
   if (byPlayer.has(plain)) return byPlayer.get(plain);
 
   // Then last-name + initial
+  let best = null;
   for (const [k,obj] of byPlayer.entries()){
     const p = stripDiacritics(k.replace(/\./g,'')).split(/\s+/);
     const last2 = p[p.length-1] || "";
@@ -168,16 +169,45 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   return best;
 }
 
+// Simple API health check (shadow) to render bottom status
+async function checkApis(){
+  const endpoints = [
+    { key: "odds-mlb-hr", url: "/.netlify/functions/odds-mlb-hr" },
+    { key: "odds-props(league)", url: "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us" },
+    { key: "odds-props(sport)",  url: "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us" }
+  ];
+  const out = [];
+  for (const ep of endpoints){
+    const t0 = performance.now();
+    try{
+      const r = await fetch(ep.url, { method: "GET" });
+      const ms = Math.round(performance.now() - t0);
+      out.push({ key: ep.key, ok: r.ok, ms });
+    }catch{
+      const ms = Math.round(performance.now() - t0);
+      out.push({ key: ep.key, ok: false, ms });
+    }
+  }
+  return out;
+}
+
 // ---------- component ----------
 export default function MLB(){
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
-  const [diag, setDiag] = useState({ source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null, slateDate:null, rr2:0, rr3:0, unitMemo:"" });
+  const [diag, setDiag] = useState({
+    source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null,
+    slateDate:null, rr2:0, rr3:0, unitMemo:"",
+    api: [], logOk: null, learn: { bullpen_shadow: true, promoted: false }
+  });
 
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
     try{
+      // parallel shadow API checks
+      const apiPromise = checkApis();
+
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
       if (!cands.length){
@@ -219,12 +249,10 @@ export default function MLB(){
         if (fair != null && liveAmerican != null){
           const liveP = probFromAmerican(liveAmerican);
           if (liveP != null){
-            edge = (fair - liveP); // absolute probability edge
-            // simplistic EV proxy (not used to size bankroll, just to tier suggestions)
+            edge = (fair - liveP);
             ev = fair * (Math.abs(liveAmerican)/100) - (1-fair);
           }
         }
-        // Unit suggestion (1x / 2x / 3x)
         let unit = "1x";
         if (edge != null){
           if (edge >= 0.04 || (anchorsSet.has(p.name) && modelProb >= 0.12)) unit = "3x";
@@ -235,9 +263,9 @@ export default function MLB(){
         return { ...p, modelProb, modelAmerican, liveAmerican, ev, edge, unit };
       });
 
-      // Round-robin suggestions: use top N by (edge desc then modelProb desc)
+      // Round-robin suggestions
       const sorted = enriched.slice().sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
-      const topN = sorted.slice(0, Math.min(8, sorted.length)); // cap to 8 for practicality
+      const topN = sorted.slice(0, Math.min(8, sorted.length));
       const rr2 = choose(topN.length, 2);
       const rr3 = choose(topN.length, 3);
       const unitMemo = (()=>{
@@ -252,7 +280,8 @@ export default function MLB(){
       const liveOddsCount = enriched.filter(p => Number.isFinite(p.liveAmerican)).length;
       const liveOddsPct = enriched.length ? Math.round(100 * liveOddsCount / enriched.length) : 0;
 
-      setDiag({ source, count: cands.length, games: games.size || uniqGames(cands), picks: enriched.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo });
+      const api = await apiPromise;
+      setDiag(d => ({ ...d, source, count: cands.length, games: games.size || uniqGames(cands), picks: enriched.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, api }));
 
       const ui = enriched.map((p) => ({
         name: cleanName(p.name||""),
@@ -266,12 +295,13 @@ export default function MLB(){
       }));
       setRows(ui);
 
-      // fire-and-forget daily log
+      // fire-and-forget daily log + remember if it worked
       (async ()=>{
+        let ok = null;
         try{
           const payload = {
             date: new Date().toISOString().slice(0,10),
-            model_version: "1.4.3-hotfix",
+            model_version: MODEL_VERSION,
             candidates: cands.length,
             games_seen: new Set(cands.map(c => c.game || (c.away && c.home ? `${c.away}@${c.home}` : ""))).size,
             bullpen_adjustment: { enabled: false, avg_delta_pp: 0, pct_gt_0_2pp: 0 },
@@ -284,13 +314,15 @@ export default function MLB(){
               why: buildWhy(p)
             }))
           };
-          await fetch('/.netlify/functions/log_model_day', {
+          const resp = await fetch('/.netlify/functions/log_model_day', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify(payload),
             keepalive: true
           });
-        }catch{}
+          ok = resp.ok;
+        }catch{ ok = false; }
+        setDiag(d => ({ ...d, logOk: ok }));
       })();
 
     }catch(e){
@@ -378,8 +410,8 @@ export default function MLB(){
         <div className="text-gray-500">No picks yet.</div>
       )}
 
-      {/* Footer diagnostics with green/red chips and RR info */}
-      <div className="mt-6 text-sm text-gray-700 space-y-2">
+      {/* Footer diagnostics with green/red chips, RR info, API + learning status */}
+      <div className="mt-6 text-sm text-gray-700 space-y-3">
         <div><strong>Diagnostics:</strong></div>
         <div className="flex flex-wrap gap-2">
           <Chip ok={diag.picks>=8}>Picks: {diag.picks}</Chip>
@@ -387,8 +419,24 @@ export default function MLB(){
           <Chip ok={diag.avgProb!=null && diag.avgProb>=12}>Avg prob: {diag.avgProb!=null ? diag.avgProb.toFixed(1)+'%' : '—'}</Chip>
           <Chip ok={diag.liveOddsPct!=null && diag.liveOddsPct>=70}>Live odds coverage: {diag.liveOddsPct!=null ? diag.liveOddsPct+'%' : '—'}</Chip>
         </div>
-        <div className="text-sm">
+        <div>
           <strong>RR Guide:</strong> 2-legs = {diag.rr2}, 3-legs = {diag.rr3} • Suggested sizing: {diag.unitMemo}
+        </div>
+        <div>
+          <strong>API status:</strong>
+          <div className="flex flex-wrap gap-2 mt-1">
+            {diag.api.map(a => (
+              <Chip key={a.key} ok={a.ok}>
+                {a.key}: {a.ok ? `${a.ms}ms` : "down"}
+              </Chip>
+            ))}
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Chip ok={diag.logOk===true}>Model log: {diag.logOk===true ? "posted" : (diag.logOk===false ? "failed" : "pending")}</Chip>
+          <Chip ok={!diag.learn.promoted}>Bullpen shadow: {diag.learn.bullpen_shadow ? "on" : "off"}</Chip>
+          <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
+          <Chip ok={true}>Features: fuzzy_match • rr_units</Chip>
         </div>
       </div>
     </div>

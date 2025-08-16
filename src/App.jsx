@@ -3,27 +3,26 @@ import React, { Suspense } from "react";
 import { BrowserRouter, Routes, Route, Link, Navigate } from "react-router-dom";
 import MLB from "./MLB.jsx";
 
-// Use React.lazy without top-level await.
-// If the import fails at runtime, fall back to a stub component.
+// Use React.lazy without top-level await and graceful fallbacks.
 const Stub = (label) => () => <div className="p-6">{label} page coming back soon.</div>;
 
 const NFL = React.lazy(() =>
-  import("./NFL.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("NFL") }))
+  import("./NFL.jsx").then(m => ({ default: m.default })).catch(() => ({ default: Stub("NFL") }))
 );
 const Soccer = React.lazy(() =>
-  import("./Soccer.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("Soccer") }))
+  import("./Soccer.jsx").then(m => ({ default: m.default })).catch(() => ({ default: Stub("Soccer") }))
 );
 const Tracking = React.lazy(() =>
-  import("./Tracking.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("Tracking") }))
+  import("./Tracking.jsx").then(m => ({ default: m.default })).catch(() => ({ default: Stub("Tracking") }))
 );
 const SB2Hits = React.lazy(() =>
-  import("./SB2Hits.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("SB 2+ Hits") }))
+  import("./SB2Hits.jsx").then(m => ({ default: m.default })).catch(() => ({ default: Stub("SB 2+ Hits") }))
 );
 const AnytimeTD = React.lazy(() =>
-  import("./AnytimeTD.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("Anytime TD") }))
+  import("./AnytimeTD.jsx").then(m => ({ default: m.default })).catch(() => ({ default: Stub("Anytime TD") }))
 );
 const NeggCorr = React.lazy(() =>
-  import("./NeggCorr.jsx").then(mod => ({ default: mod.default })).catch(() => ({ default: Stub("NeggCorr") }))
+  import("./NeggCorr.jsx").then(m => ({ default: m.default })).catch(() => ({ default: Stub("NeggCorr") }))
 );
 
 function Picker(){
