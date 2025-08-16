@@ -3,11 +3,7 @@
 import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
-import { normalizePlayerName } from "./src/lib/common/name_map.js"; // tolerate both paths
-import { normalizePlayerName as _np } from "./lib/common/name_map.js"; // fallback for existing structure
-const normalize = (s)=>{
-  try{ return normalizePlayerName(s); }catch{ try{ return _np(s);}catch{return s||"";} }
-};
+import { normalizePlayerName } from "./lib/common/name_map.js";
 
 function americanFromProb(p){
   const x = Math.max(1e-6, Math.min(0.999999, Number(p)||0));
@@ -28,9 +24,12 @@ function uniqGames(cands){
 function normalizeCandidates(raw){
   const out = [];
   if (!raw) return out;
+  const norm = (s)=>{
+    try{ return normalizePlayerName(s); }catch{return s||"";}
+  };
   const push = (obj) => {
     if (!obj) return;
-    const name = normalize(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
+    const name = norm(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
     const home = obj.home || obj.home_team || obj.homeTeam || obj.teamHome;
     const away = obj.away || obj.away_team || obj.awayTeam || obj.teamAway || obj.opponent;
     const game = obj.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
@@ -66,29 +65,7 @@ function normalizeCandidates(raw){
   }
   return out;
 }
-useEffect(() => {
-  async function fetchAndLog() {
-    // existing logic: selectHRPicks, scoreHRPick, etc.
-    const candidates = selectHRPicks(...);
 
-    // 🔴 Add log POST here
-    try {
-      await fetch("/.netlify/functions/log_model_day", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          date: new Date().toISOString().slice(0, 10),
-          candidates,
-          meta: { source: "MLB.jsx", algo: "baseline" }
-        })
-      });
-    } catch (e) {
-      console.error("Log post failed", e);
-    }
-  }
-
-  fetchAndLog();
-}, []);
 async function fetchPrimary(){
   try{
     const r = await fetch('/.netlify/functions/odds-mlb-hr');
@@ -104,6 +81,9 @@ async function fetchFallback(){
     if(!r.ok) return [];
     const data = await r.json();
     const out = [];
+    const norm = (s)=>{
+      try{ return normalizePlayerName(s); }catch{return s||"";}
+    };
     for (const ev of (data?.events||[])){
       const home = ev.home_team || ev.homeTeam || "";
       const away = ev.away_team || ev.awayTeam || "";
@@ -114,7 +94,7 @@ async function fetchFallback(){
           const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
           if (!isHR) continue;
           for (const oc of (mk.outcomes||[])){
-            const player = normalize(oc.name || oc.description || oc.participant || "");
+            const player = norm(oc.name || oc.description || oc.participant || "");
             const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
             if (!player || !Number.isFinite(price)) continue;
             out.push({ name: player, home, away, game, eventId: ev.id, oddsAmerican: price });
@@ -131,13 +111,16 @@ async function fetchHROddsIndex(){
     if(!r.ok) return new Map();
     const data = await r.json();
     const map = new Map();
+    const norm = (s)=>{
+      try{ return normalizePlayerName(s); }catch{return s||"";}
+    };
     if(Array.isArray(data?.events)){
       for (const ev of data.events){
         const gameCode = (ev?.home_team && ev?.away_team) ? `${ev.away_team}@${ev.home_team}` : (ev?.id || ev?.commence_time || "");
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
             for (const oc of (mk.outcomes||[])){
-              const player = normalize(oc.name || oc.description || oc.participant || "");
+              const player = norm(oc.name || oc.description || oc.participant || "");
               const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
               if (!player || !Number.isFinite(price)) continue;
               const key = `${gameCode}|${player}`.toLowerCase();
@@ -171,7 +154,7 @@ export default function MLB(){
       // Join live odds when available
       const idx = await fetchHROddsIndex();
       cands = cands.map(c => {
-        const key = `${c.game}|${normalize(c.name)}`.toLowerCase();
+        const key = `${c.game}|${normalizePlayerName(c.name||"")}`.toLowerCase();
         const joined = idx.get(key);
         return { ...c, oddsAmerican: Number.isFinite(joined) ? joined : c.oddsAmerican };
       });
@@ -192,6 +175,34 @@ export default function MLB(){
         why: p.why2 || p.why || "—",
       }));
       setRows(ui);
+
+      // ---- fire-and-forget daily log to Netlify Blobs via function ----
+      (async ()=>{
+        try{
+          const payload = {
+            date: new Date().toISOString().slice(0,10),
+            model_version: "1.4.3-hotfix",
+            candidates: cands.length,
+            games_seen: new Set(cands.map(c => c.game || (c.away && c.home ? `${c.away}@${c.home}` : ""))).size,
+            bullpen_adjustment: { enabled: false, avg_delta_pp: 0, pct_gt_0_2pp: 0 },
+            picks: picks.map(p => ({
+              player: p.name,
+              prob_pp: p.p_final != null ? +(p.p_final*100).toFixed(1) : null,
+              prob_pp_shadow_bullpen: p.p_final != null ? +(p.p_final*100).toFixed(1) : null,
+              bullpen_delta_pp: 0,
+              why: p.why2 || p.why || ""
+            }))
+          };
+          await fetch('/.netlify/functions/log_model_day', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+            keepalive: true
+          });
+        }catch{}
+      })();
+      // -----------------------------------------------------------------
+
     }catch(e){
       setMessage(String(e?.message||e));
       console.error(e);
