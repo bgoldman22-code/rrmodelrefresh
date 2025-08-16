@@ -1,4 +1,6 @@
 // src/lib/common/odds_fallback.js
+import { fetchJSONFlexible, firstEventsArray } from "./safe_json.js";
+
 function cleanName(s){ return String(s||"").replace(/\./g,"").replace(/\s+/g," ").trim(); }
 function isHRMarketKey(key){
   if (!key) return false;
@@ -16,7 +18,43 @@ function extractAmerican(oc){
   const n2 = Number(str);
   return Number.isFinite(n2) ? Math.round(n2) : null;
 }
-export async function buildCandidatesFromOddsPropsHardened(){
+function harvestFromEventsArray(events){
+  const candidates = [];
+  let marketsSeen=0, outcomesSeen=0;
+  for (const ev of (events||[])){
+    const home = ev.home_team || ev.homeTeam || ev.home || "";
+    const away = ev.away_team || ev.awayTeam || ev.away || "";
+    const game = away && home ? `${String(away).trim()}@${String(home).trim()}` : (ev.id || ev.commence_time || "");
+    const books = ev.bookmakers || ev.books || ev.sportsbooks || [];
+    for (const bk of books){
+      const mkts = bk.markets || bk.props || bk.lines || [];
+      for (const mk of mkts){
+        const key = mk?.key || mk?.key_name || mk?.market || mk?.title || "";
+        if (!isHRMarketKey(key)) continue;
+        marketsSeen++;
+        const outs = mk.outcomes || mk.options || mk.selections || [];
+        for (const oc of outs){
+          const rawName = oc?.name || oc?.description || oc?.participant || oc?.label || "";
+          const price = extractAmerican(oc);
+          if (!Number.isFinite(price)) continue;
+          const isYesNo = typeof rawName === "string" && (rawName.toLowerCase() === "yes" || rawName.toLowerCase() === "no");
+          if (isYesNo && rawName.toLowerCase() !== "yes") continue;
+          let player = rawName;
+          if (isYesNo){
+            player = oc?.player || oc?.participant || oc?.runner || oc?.description || oc?.label || "";
+          }
+          player = cleanName(player);
+          if (!player) continue;
+          candidates.push({ name: player, team:"", home, away, game, eventId: ev.id || ev.commence_time || "", oddsAmerican: price });
+          outcomesSeen++;
+        }
+      }
+    }
+  }
+  return { candidates, marketsSeen, outcomesSeen };
+}
+
+export async function buildCandidatesFromOddsPropsFlexible(){
   const urls = [
     '/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us',
     '/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us',
@@ -27,39 +65,12 @@ export async function buildCandidatesFromOddsPropsHardened(){
   const tried = [];
   for (const url of urls){
     try{
-      const r = await fetch(url);
-      tried.push({ url, status: r?.status ?? null });
-      if (!r.ok) continue;
-      const data = await r.json();
-      const candidates = [];
-      let marketsSeen = 0, outcomesSeen = 0;
-      for (const ev of (data?.events||[])){
-        const home = ev.home_team || ev.homeTeam || "";
-        const away = ev.away_team || ev.awayTeam || "";
-        const game = away && home ? `${String(away).trim()}@${String(home).trim()}` : (ev.id || ev.commence_time || "");
-        for (const bk of (ev.bookmakers||[])){
-          for (const mk of (bk.markets||[])){
-            const key = mk?.key || mk?.key_name || mk?.market || mk?.title || "";
-            if (!isHRMarketKey(key)) continue;
-            marketsSeen++;
-            for (const oc of (mk.outcomes||[])){
-              const rawName = oc?.name || oc?.description || oc?.participant || "";
-              const price = extractAmerican(oc);
-              if (!Number.isFinite(price)) continue;
-              const isYesNo = typeof rawName === "string" && (rawName.toLowerCase() === "yes" || rawName.toLowerCase() === "no");
-              if (isYesNo && rawName.toLowerCase() !== "yes") continue;
-              let player = rawName;
-              if (isYesNo){
-                player = oc?.player || oc?.participant || oc?.runner || oc?.description || oc?.label || "";
-              }
-              player = cleanName(player);
-              if (!player) continue;
-              candidates.push({ name: player, team: "", home, away, game, eventId: ev.id || ev.commence_time || "", oddsAmerican: price });
-              outcomesSeen++;
-            }
-          }
-        }
-      }
+      const { status, text, json } = await fetchJSONFlexible(url);
+      tried.push({ url, status, bytes: (text||"").length });
+      if (status !== 200 || !text) continue;
+      const events = Array.isArray(json?.events) ? json.events : firstEventsArray(json);
+      if (!Array.isArray(events) || !events.length) continue;
+      const { candidates, marketsSeen, outcomesSeen } = harvestFromEventsArray(events);
       if (candidates.length){
         return { candidates, sourceTried: url, counts: { marketsSeen, outcomesSeen }, tried };
       }

@@ -1,8 +1,8 @@
-// src/MLB.jsx (shows tried-URL statuses if fallback yields 0)
+// src/MLB.jsx (wired to flexible fallback + short diagnostics)
 import React, { useEffect, useState } from "react";
 import { selectHRPicks } from "./models/hr_select.js";
 import { scoreHRPick } from "./models/hr_scoring.js";
-import { buildCandidatesFromOddsPropsHardened } from "./lib/common/odds_fallback.js";
+import { buildCandidatesFromOddsPropsFlexible } from "./lib/common/odds_fallback.js";
 
 function americanToProb(odds){
   if (odds == null || isNaN(odds)) return null;
@@ -60,6 +60,9 @@ function normalizeCandidates(raw){
     if (Array.isArray(raw.candidates)) raw.candidates.forEach(push);
     if (Array.isArray(raw.players)) raw.players.forEach(push);
     if (Array.isArray(raw.events)) raw.events.forEach(push);
+    // check nested common wrappers: {data:{...}} etc
+    if (raw.data) return out.concat(normalizeCandidates(raw.data));
+    if (raw.response) return out.concat(normalizeCandidates(raw.response));
   }
   return out;
 }
@@ -70,8 +73,9 @@ async function fetchHROddsIndex(){
     if(!r.ok) return new Map();
     const data = await r.json();
     const map = new Map();
-    if(Array.isArray(data?.events)){
-      for (const ev of data.events){
+    const events = Array.isArray(data?.events) ? data.events : (data?.data?.events || []);
+    if(Array.isArray(events)){
+      for (const ev of events){
         const gameCode = (ev?.home_team && ev?.away_team) ? `${ev.away_team}@${ev.home_team}` : (ev?.id || ev?.commence_time || "");
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
@@ -119,13 +123,13 @@ export default function MLB(){
       let dataSource = '/.netlify/functions/odds-mlb-hr';
 
       if (!cands.length) {
-        const fb = await buildCandidatesFromOddsPropsHardened();
+        const fb = await buildCandidatesFromOddsPropsFlexible();
         if (fb.candidates?.length) {
           cands = fb.candidates;
           dataSource = `odds-props fallback (${fb.sourceTried||"no-source"})`;
           console.info("Fallback diagnostics:", fb);
         } else {
-          const detail = (fb.tried||[]).map(t => `${t.url}→${t.status}`).join(" | ");
+          const detail = (fb.tried||[]).slice(0,3).map(t => `${t.url}→${t.status}/${t.bytes||0}b`).join(" | ");
           throw new Error(`No candidates: primary empty and fallback parsed 0. Tried: ${detail || "no attempts"}`);
         }
       }
