@@ -1,7 +1,8 @@
-// src/MLB.jsx
+// src/MLB.jsx  (with fallback pre-wired)
 import React, { useEffect, useState } from "react";
 import { selectHRPicks } from "./models/hr_select.js";
 import { scoreHRPick } from "./models/hr_scoring.js";
+import { buildCandidatesFromOddsProps } from "./lib/common/odds_fallback.js";
 
 function americanToProb(odds){
   if (odds == null || isNaN(odds)) return null;
@@ -17,7 +18,6 @@ function americanFromProb(p){
 function normalizeCandidates(raw){
   const out = [];
   if (!raw) return out;
-
   const push = (obj) => {
     if (!obj) return;
     const name = obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "";
@@ -48,10 +48,14 @@ function normalizeCandidates(raw){
       barrelRate: obj.barrelRate ?? obj.barrel_rate ?? obj.brls_pa ?? obj.barrels_per_pa ?? null,
       recentHRperPA: obj.recentHRperPA ?? obj.hr_per_pa_l15 ?? obj.l15_hr_pa ?? 0,
       platoonFlag: obj.platoonFlag ?? obj.platoon ?? null,
+      bats: obj.bats || obj.batterHand || obj.handedBat || null,
+      oppThrows: obj.oppThrows || obj.pitcherThrows || obj.starterThrows || null,
+      iso_vs_rhp: obj.iso_vs_rhp || obj.iso_v_r || obj.iso_vr || null,
+      iso_vs_lhp: obj.iso_vs_lhp || obj.iso_v_l || obj.iso_vl || null,
+      fbPct: obj.fbPct || obj.fb_rate || obj.flyballRate || null,
+      pullPct: obj.pullPct || obj.pull_rate || obj.pullRate || null
     });
   };
-
-  // Accept multiple container shapes
   if (Array.isArray(raw)) raw.forEach(push);
   else if (raw && typeof raw === "object"){
     if (Array.isArray(raw.candidates)) raw.candidates.forEach(push);
@@ -110,14 +114,21 @@ export default function MLB(){
   async function generate(){
     setLoading(true); setMessage(""); setPicks([]);
     try{
-      // 1) Get candidates from your Netlify function
+      // 1) Primary: get candidates from your Netlify function
       const baseRes = await fetch('/.netlify/functions/odds-mlb-hr');
       if(!baseRes.ok) throw new Error(`odds-mlb-hr HTTP ${baseRes.status}`);
       const baseJson = await baseRes.json();
       let cands = normalizeCandidates(baseJson);
-      if (!cands.length) throw new Error('No candidates returned');
+      let dataSource = '/.netlify/functions/odds-mlb-hr';
 
-      // 2) Join live HR odds
+      // 1b) Fallback: if zero, build from odds-props
+      if (!cands.length) {
+        const fb = await buildCandidatesFromOddsProps();
+        if (fb.length) { cands = fb; dataSource = '/.netlify/functions/odds-props (fallback)'; }
+      }
+      if (!cands.length) throw new Error('No candidates returned (primary and fallback both empty)');
+
+      // 2) Join live HR odds (best seen)
       const idx = await fetchHROddsIndex();
       cands = cands.map(c => {
         const key = `${c.game}|${c.name}`.toLowerCase();
@@ -128,7 +139,7 @@ export default function MLB(){
       // 3) Score and select
       const scored = cands.map(scoreHRPick);
       const { picks: chosen, message: chooseMsg } = selectHRPicks(scored);
-      setDiag({ source: "/.netlify/functions/odds-mlb-hr", count: cands.length, games: gamesSeen(cands) });
+      setDiag({ source: dataSource, count: cands.length, games: gamesSeen(cands) });
       setMessage(chooseMsg || "");
 
       // 4) Shape for UI
@@ -136,8 +147,8 @@ export default function MLB(){
         name: p.name,
         team: p.team,
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || ""),
-        modelProb: p.p_blended ?? p.p_model ?? null,
-        modelAmerican: p.modelAmerican ?? (p.p_blended ? americanFromProb(p.p_blended) : null),
+        modelProb: p.p_final ?? p.p_blended ?? p.p_model ?? null,
+        modelAmerican: p.modelAmerican ?? (p.p_final ? americanFromProb(p.p_final) : null),
         oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
         why: p.why2 || (Array.isArray(p.reasons) ? p.reasons.join(" • ") : ""),
       }));
@@ -150,11 +161,7 @@ export default function MLB(){
     }
   }
 
-  useEffect(()=>{
-    // Auto-generate on first mount to save clicks
-    generate();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEffect(()=>{ generate(); }, []);
 
   return (
     <div className="p-6">
