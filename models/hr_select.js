@@ -1,5 +1,5 @@
 \
-/* models/hr_select.js */
+// models/hr_select.js
 import { normalizePlayerName } from "../src/lib/common/name_map.js";
 
 const POWER_ANCHORS = new Set([

@@ -1,5 +1,5 @@
 \
-/* src/lib/common/name_map.js */
+// src/lib/common/name_map.js
 function stripDiacritics(s){
   try{ return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }catch{ return s; }
 }

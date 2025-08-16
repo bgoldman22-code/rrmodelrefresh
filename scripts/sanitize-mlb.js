@@ -1,8 +1,5 @@
 \
 // scripts/sanitize-mlb.js
-// Cleans src/MLB.jsx before build: strips BOM, removes any leading garbage lines
-// (like accidental Netlify log strings) so file begins with a valid JS token.
-
 import fs from 'fs';
 
 const path = 'src/MLB.jsx';
@@ -12,16 +9,13 @@ if (!fs.existsSync(path)) {
 }
 
 let buf = fs.readFileSync(path);
+// strip BOM if present
 if (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
-  buf = buf.slice(3); // strip BOM
+  buf = buf.slice(3);
 }
 let text = buf.toString('utf8');
 
-// Keep everything from the first line that looks like a JS start:
-// - starts with 'import '
-// - or starts with '/*' or '//' (a comment header)
-// If neither is found, leave file as-is but warn.
-const lines = text.split(/\\r?\\n/);
+const lines = text.split(/\r?\n/);
 let start = 0;
 for (let i = 0; i < lines.length; i++) {
   const L = lines[i].trimStart();
@@ -31,7 +25,7 @@ for (let i = 0; i < lines.length; i++) {
   }
 }
 if (start > 0) {
-  const cleaned = lines.slice(start).join('\\n');
+  const cleaned = lines.slice(start).join('\n');
   fs.writeFileSync(path, cleaned, 'utf8');
   console.log(`[sanitize-mlb] removed ${start} leading garbage line(s).`);
 } else {
