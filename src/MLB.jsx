@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-heuristic-why-footer";
+const MODEL_VERSION = "1.4.3-hotfix-multi-fallback";
 
 // ---------- helpers ----------
 function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
@@ -18,15 +18,8 @@ function probFromAmerican(amer){
   if (a > 0) return 100/(a+100);
   return -a/(-a+100);
 }
-function uniqGamesFromOddsContext(ctx){ return ctx?.games ? ctx.games.size : 0; }
-function cleanName(name){
-  if (!name) return "";
-  // strip invisible characters that were leaking into names
-  return String(name).replace(/[\u200B-\u200D\u2060]/g, "");
-}
-function stripDiacritics(s){
-  return (s||"").normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-}
+function clean(s){ return (s==null? "" : String(s).replace(/\s+/g,' ').trim()); }
+function stripDiacritics(s){ return (s||"").normalize('NFD').replace(/[\u0300-\u036f]/g,''); }
 function fmtAmerican(v){ return v>0?`+${v}`:String(v); }
 function choose(n, k){
   if (k<0 || k>n) return 0;
@@ -38,7 +31,6 @@ function choose(n, k){
 // Normalize incoming candidates without mutating player names
 function normalizeCandidates(raw){
   const out = [];
-  const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
   const push = (obj)=>{
     if (!obj) return;
     const name = clean(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
@@ -85,56 +77,64 @@ async function fetchPrimary(){
   try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
 
-// Build odds context; also infer slate date
+// Build odds context; try several URLs in order and merge
 async function fetchOddsContext(){
-  const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set() };
-  try{
-    const r = await fetch('/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us');
-    if(!r.ok) return empty;
-    const data = await r.json();
-    const byGamePlayer = new Map();
-    const byPlayer = new Map();
-    const games = new Set();
-    let earliest = null;
-    const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
-    for (const ev of (data?.events||[])){
-      const home = ev.home_team || ev.homeTeam || "";
-      const away = ev.away_team || ev.awayTeam || "";
-      const game = away && home ? `${clean(away)}@${clean(home)}` : (ev.id || "");
-      if (home && away) games.add(game);
-      const ctime = ev.commence_time || ev.commenceTime;
-      if (ctime){
-        const dt = new Date(ctime);
-        if (!isNaN(dt.getTime())){
-          if (earliest==null || dt < earliest) earliest = dt;
+  const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set(), tried: [] };
+  const urls = [
+    "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
+    "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us",
+    "/.netlify/functions/odds-props?league=mlb&regions=us",
+    "/.netlify/functions/odds-props?sport=baseball_mlb&regions=us"
+  ];
+  const byGamePlayer = new Map();
+  const byPlayer = new Map();
+  const games = new Set();
+  let earliest = null;
+  const tried = [];
+  for (const url of urls){
+    tried.push(url);
+    try{
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      const data = await r.json();
+      for (const ev of (data?.events||[])){
+        const home = ev.home_team || ev.homeTeam || "";
+        const away = ev.away_team || ev.awayTeam || "";
+        const game = away && home ? `${clean(away)}@${clean(home)}` : (ev.id || "");
+        if (home && away) games.add(game);
+        const ctime = ev.commence_time || ev.commenceTime;
+        if (ctime){
+          const dt = new Date(ctime);
+          if (!isNaN(dt.getTime())){
+            if (earliest==null || dt < earliest) earliest = dt;
+          }
         }
-      }
-      for (const bk of (ev.bookmakers||[])){
-        for (const mk of (bk.markets||[])){
-          const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
-          const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
-          if (!isHR) continue;
-          for (const oc of (mk.outcomes||[])){
-            const player = clean(oc.name || oc.description || oc.participant || "");
-            let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
-            if (!player || !Number.isFinite(price) || price === 0) continue;
-            const k1 = `${game}|${player}`.toLowerCase();
-            if (!byGamePlayer.has(k1) || Math.abs(price) < Math.abs(byGamePlayer.get(k1).price)){
-              byGamePlayer.set(k1, { price, game, name: player });
-            }
-            const k2 = player.toLowerCase();
-            if (!byPlayer.has(k2) || Math.abs(price) < Math.abs(byPlayer.get(k2).price)){
-              byPlayer.set(k2, { price, game, name: player });
+        for (const bk of (ev.bookmakers||[])){
+          for (const mk of (bk.markets||[])){
+            const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
+            const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
+            if (!isHR && mk.key) continue;
+            for (const oc of (mk.outcomes||[])){
+              const player = clean(oc.name || oc.description || oc.participant || "");
+              let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
+              if (!player || !Number.isFinite(price) || price === 0) continue;
+              const k1 = `${game}|${player}`.toLowerCase();
+              if (!byGamePlayer.has(k1) || Math.abs(price) < Math.abs(byGamePlayer.get(k1).price)){
+                byGamePlayer.set(k1, { price, game, name: player });
+              }
+              const k2 = player.toLowerCase();
+              if (!byPlayer.has(k2) || Math.abs(price) < Math.abs(byPlayer.get(k2).price)){
+                byPlayer.set(k2, { price, game, name: player });
+              }
             }
           }
         }
       }
-    }
-    const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
-    return { byGamePlayer, byPlayer, slateDate, games };
-  }catch{
-    return empty;
+    }catch{/* keep trying next */}
+    if (byGamePlayer.size) break; // stop at first that yields data
   }
+  const slateDate = earliest ? earliest.toLocaleDateString(undefined, { year:'numeric', month:'short', day:'2-digit' }) : null;
+  return { byGamePlayer, byPlayer, slateDate, games, tried };
 }
 
 // Fuzzy match for odds
@@ -160,38 +160,15 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   return best;
 }
 
-// Heuristic prob if model didn't supply one (kept conservative)
+// Heuristic prob if model didn't supply one
 function heuristicProb(p){
-  // Base 3.5% per game target (not per-PA), then add tiny bumps
   let prob = 0.035;
-  if (p.iso != null) prob += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04); // ISO above league adds
+  if (p.iso != null) prob += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04);
   if (p.barrelRate != null) prob += clamp((Number(p.barrelRate)-0.07)*0.35, -0.01, 0.05);
   if (p.recentHRperPA != null) prob += clamp(Number(p.recentHRperPA)*0.6, 0, 0.05);
   if (p.starterHR9 != null) prob += clamp((Number(p.starterHR9)-1.0)*0.015, -0.015, 0.03);
-  prob = clamp(prob, 0.01, 0.20); // cap to sane range
+  prob = clamp(prob, 0.01, 0.20);
   return prob;
-}
-
-// Simple API health (for footer)
-async function checkApis(){
-  const endpoints = [
-    { key: "odds-mlb-hr", url: "/.netlify/functions/odds-mlb-hr" },
-    { key: "odds-props(league)", url: "/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us" },
-    { key: "odds-props(sport)",  url: "/.netlify/functions/odds-props?sport=baseball_mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us" }
-  ];
-  const out = [];
-  for (const ep of endpoints){
-    const t0 = performance.now();
-    try{
-      const r = await fetch(ep.url, { method: "GET" });
-      const ms = Math.round(performance.now() - t0);
-      out.push({ key: ep.key, ok: r.ok, ms });
-    }catch{
-      const ms = Math.round(performance.now() - t0);
-      out.push({ key: ep.key, ok: false, ms });
-    }
-  }
-  return out;
 }
 
 // ---------- component ----------
@@ -202,27 +179,28 @@ export default function MLB(){
   const [diag, setDiag] = useState({
     source:"—", count:0, games:0, picks:0, anchors:0, avgProb:null, liveOddsPct:null,
     slateDate:null, rr2:0, rr3:0, unitMemo:"",
-    api: [], logOk: null, learn: { bullpen_shadow: true, promoted: false }
+    apiTried: [], logOk: null, learn: { bullpen_shadow: true, promoted: false }
   });
 
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
     try{
-      const apiPromise = checkApis();
-      const ctx = await fetchOddsContext(); // get slate date + games even if primary is sparse
+      const ctx = await fetchOddsContext(); // collect games/slate from the most permissive odds route
 
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
-      if (!cands.length){
-        const fromOdds = Array.from(ctx.byGamePlayer.keys()).map(k => {
-          const [g, player] = k.split("|");
-          const rec = ctx.byGamePlayer.get(k);
-          const [away,home] = (g||"").split("@");
-          return { name: rec.name || player, game: g, home, away, team:"—", oddsAmerican: rec.price };
+      if (!cands.length && ctx.byGamePlayer.size){
+        // Build candidates directly from odds when primary is empty
+        const fromOdds = Array.from(ctx.byGamePlayer.values()).map(rec => {
+          const [away,home] = (rec.game||"").split("@");
+          return { name: rec.name, game: rec.game, home, away, team:"—", oddsAmerican: rec.price };
         });
-        if (fromOdds.length){ cands = fromOdds; source = "odds-props (fallback)"; }
+        if (fromOdds.length){ cands = fromOdds; source = "odds-props (fallback via context)"; }
       }
-      if (!cands.length) throw new Error("No candidates (primary and fallback empty)");
+      if (!cands.length){
+        setDiag(d => ({ ...d, source:"(no data)", count:0, games: ctx.games.size, slateDate: ctx.slateDate, apiTried: ctx.tried }));
+        throw new Error("No candidates (primary and fallback empty)");
+      }
 
       // Join live odds
       const { byGamePlayer, byPlayer, slateDate } = ctx;
@@ -239,7 +217,6 @@ export default function MLB(){
       const { picks, message: chooseMsg } = selectHRPicks(scored);
       setMessage(chooseMsg || "");
 
-      // If model didn't supply prob, use heuristic (so table isn't blank)
       const anchorsSet = new Set(["Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge","Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager","Marcell Ozuna","Kyle Tucker","Rafael Devers"]);
       const anchors = picks.filter(p => anchorsSet.has(String(p.name))).length;
 
@@ -263,10 +240,8 @@ export default function MLB(){
         return { ...p, modelProb, modelAmerican, liveAmerican, edge, unit };
       });
 
-      // Filter out obvious junk late-night: require either live odds present OR modelProb >= 6%
+      // Filter late-junk: requires odds or >=6%
       const filtered = enriched.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
-
-      // Sort by edge then prob; keep top 12
       const sorted = filtered.slice().sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
       const topN = sorted.slice(0, 12);
 
@@ -284,11 +259,10 @@ export default function MLB(){
       const liveOddsCount = topN.filter(p => Number.isFinite(p.liveAmerican)).length;
       const liveOddsPct = topN.length ? Math.round(100 * liveOddsCount / topN.length) : 0;
 
-      const api = await apiPromise;
-      setDiag(d => ({ ...d, source, count: cands.length, games: uniqGamesFromOddsContext(ctx) || 0, picks: topN.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, api }));
+      setDiag(d => ({ ...d, source, count: cands.length, games: ctx.games.size, picks: topN.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, apiTried: ctx.tried }));
 
       const ui = topN.map((p) => ({
-        name: cleanName(p.name||""),
+        name: String(p.name||"").replace(/[\u200B-\u200D\u2060]/g, ""),
         team: p.team||"—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
         modelProb: p.modelProb ?? null,
@@ -299,34 +273,7 @@ export default function MLB(){
       }));
       setRows(ui);
 
-      // fire-and-forget daily log + remember if it worked
-      (async ()=>{
-        let ok = null;
-        try{
-          const payload = {
-            date: new Date().toISOString().slice(0,10),
-            model_version: MODEL_VERSION,
-            candidates: cands.length,
-            games_seen: ctx.games.size,
-            rr: { rr2, rr3, unitMemo },
-            picks: ui.map(p => ({
-              player: p.name,
-              prob_pp: p.modelProb != null ? +(p.modelProb*100).toFixed(1) : null,
-              live_amer: p.oddsAmerican,
-              unit: p.unit,
-              why: p.why
-            }))
-          };
-          const resp = await fetch('/.netlify/functions/log_model_day', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(payload),
-            keepalive: true
-          });
-          ok = resp.ok;
-        }catch{ ok = false; }
-        setDiag(d => ({ ...d, logOk: ok }));
-      })();
+      // No logging here to keep the repro simple while we stabilize feeds
 
     }catch(e){
       setMessage(String(e?.message||e));
@@ -341,15 +288,8 @@ export default function MLB(){
   // WHY text: varied and human
   function buildWhy(p){
     const facts = [];
-
-    // Handedness split preference
-    if (p.oppThrows && p.bats){
-      facts.push(`${p.bats.toUpperCase()} vs ${p.oppThrows.toUpperCase()} match-up`);
-    } else if (p.oppThrows){
-      facts.push(`faces a ${p.oppThrows.toUpperCase()}HP`);
-    }
-
-    // Power signatures
+    if (p.oppThrows && p.bats){ facts.push(`${p.bats.toUpperCase()} vs ${p.oppThrows.toUpperCase()} match-up`); }
+    else if (p.oppThrows){ facts.push(`faces a ${p.oppThrows.toUpperCase()}HP`); }
     if (p.iso != null){
       const iso = Number(p.iso);
       if (iso >= 0.220) facts.push(`extra-base profile (ISO ${iso.toFixed(3)})`);
@@ -363,28 +303,20 @@ export default function MLB(){
       const fb = Number(p.fbPct)*100, pl = Number(p.pullPct)*100;
       if (fb >= 35 && pl >= 40) facts.push(`air + pull combo (${fb.toFixed(0)}% FB, ${pl.toFixed(0)}% pull)`);
     }
-
-    // Recent form
     if (p.recentHRperPA != null){
       const r = Number(p.recentHRperPA)*100;
       if (r >= 2.0) facts.push(`L15 HR/PA ${r.toFixed(1)}%`);
     }
-
-    // Opponent starter HR/9
     if (p.starterHR9 != null){
       const s = Number(p.starterHR9);
       if (s >= 1.3) facts.push(`opponent allows ${s.toFixed(2)} HR/9`);
     }
-
-    // BvP fun fact (only if real sample)
     if (p.bvpPA != null && p.bvpPA >= 8 && p.bvpHR >= 1){
       facts.push(`BvP: ${p.bvpHR} HR in ${p.bvpPA} PA`);
     }
-
-    // PAs context
     if (p.expPA != null) facts.push(`~${p.expPA} PAs`);
 
-    const head = cleanName(p.name||"");
+    const head = String(p.name||"").replace(/[\u200B-\u200D\u2060]/g, "");
     const ctx = p.game ? ` (${p.game})` : "";
     if (!facts.length) return `${head}${ctx} — trending power spot.`;
     return `${head}${ctx} — ${facts.slice(0,4).join(" • ")}`;
@@ -398,7 +330,7 @@ export default function MLB(){
   return (
     <div className="p-6">
       <h1 className="text-2xl font-bold mb-2">
-        MLB — Home Run Picks
+        MLB — Home Run Picks {diag.slateDate ? <span className="text-base font-normal text-gray-600">({diag.slateDate})</span> : null}
       </h1>
       <p className="text-sm text-gray-600 mb-4">
         Source: {diag.source} • Candidates: {diag.count} • Games seen: {diag.games}
@@ -413,7 +345,6 @@ export default function MLB(){
           {loading ? "Generating…" : "Generate"}
         </button>
         {message ? <span className="text-sm text-gray-700">{message}</span> : null}
-        {diag.slateDate ? <span className="text-sm text-gray-500">Slate: {diag.slateDate}</span> : null}
       </div>
 
       {rows.length ? (
@@ -451,8 +382,8 @@ export default function MLB(){
         <div className="text-gray-500">No picks yet.</div>
       )}
 
-      {/* Footer: diagnostics + RR + API health in a compact table */}
-      <div className="mt-6 text-sm text-gray-700 space-y-3">
+      {/* Footer: diagnostics + RR + which endpoints tried */}
+      <div className="mt-6 text-sm text-gray-700 space-y-2">
         <div className="flex flex-wrap gap-2">
           <Chip ok={diag.picks>=8}>Picks: {diag.picks}</Chip>
           <Chip ok={diag.anchors>=2}>Anchors: {diag.anchors}</Chip>
@@ -460,41 +391,10 @@ export default function MLB(){
           <Chip ok={diag.liveOddsPct!=null && diag.liveOddsPct>=70}>Live odds coverage: {diag.liveOddsPct!=null ? diag.liveOddsPct+'%' : '—'}</Chip>
         </div>
         <div><strong>RR Guide:</strong> 2-legs = {diag.rr2}, 3-legs = {diag.rr3} • Suggested sizing: {diag.unitMemo}</div>
-
-        <div className="overflow-x-auto">
-          <table className="min-w-[420px] border">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-3 py-1 text-left">Endpoint</th>
-                <th className="px-3 py-1 text-left">Status</th>
-                <th className="px-3 py-1 text-left">Latency</th>
-              </tr>
-            </thead>
-            <tbody>
-              {diag.api.map(a => (
-                <tr key={a.key} className="border-t">
-                  <td className="px-3 py-1">{a.key}</td>
-                  <td className="px-3 py-1">{a.ok ? "OK" : "DOWN"}</td>
-                  <td className="px-3 py-1">{a.ms}ms</td>
-                </tr>
-              ))}
-              <tr className="border-t">
-                <td className="px-3 py-1">Model log</td>
-                <td className="px-3 py-1">{diag.logOk===true ? "posted" : (diag.logOk===false ? "failed" : "pending")}</td>
-                <td className="px-3 py-1">—</td>
-              </tr>
-              <tr className="border-t">
-                <td className="px-3 py-1">Learning</td>
-                <td className="px-3 py-1">{diag.learn.bullpen_shadow ? "bullpen shadow on" : "off"}</td>
-                <td className="px-3 py-1">—</td>
-              </tr>
-              <tr className="border-t">
-                <td className="px-3 py-1">Version</td>
-                <td className="px-3 py-1">{MODEL_VERSION}</td>
-                <td className="px-3 py-1">—</td>
-              </tr>
-            </tbody>
-          </table>
+        <div><strong>Odds endpoints tried:</strong> {diag.apiTried.join(" → ") || "—"}</div>
+        <div className="flex flex-wrap gap-2">
+          <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
+          <Chip ok={true}>Features: multi-fallback • fuzzy_match • rr_units</Chip>
         </div>
       </div>
     </div>
