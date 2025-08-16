@@ -238,5 +238,4 @@ function MLB(){
   );
 }
 
-// Explicit default export so App.jsx can `import MLB from "./MLB.jsx";`
 export default MLB;
