@@ -1,4 +1,3 @@
-\
 // src/lib/common/name_map.js
 function stripDiacritics(s){
   try{ return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }catch{ return s; }
@@ -19,7 +18,7 @@ export function normalizePlayerName(raw){
     "Cal Raleigh": ["C Raleigh"],
     "Juan Soto": ["J Soto"],
     "Aaron Judge": ["A Judge"],
-    "Yordan Alvarez": ["Y Alvarez","Yordan Álvarez","Y Álvarez"],
+    "Yordan Alvarez": ["Y Alvarez","Yordan Alvarez","Yordan \u00C1lvarez","Y \u00C1lvarez"],
     "Pete Alonso": ["P Alonso","Peter Alonso"],
     "Gunnar Henderson": ["G Henderson"],
     "Matt Olson": ["M Olson"],
@@ -31,10 +30,10 @@ export function normalizePlayerName(raw){
     "Kyle Higashioka": ["K Higashioka"],
     "Daylen Lile": ["D Lile"],
     "Christian Walker": ["C Walker"],
-    "Jose Altuve": ["José Altuve","J Altuve"],
+    "Jose Altuve": ["Jose Altuve","J Altuve"],
     "Carlos Correa": ["C Correa"],
-    "Yainer Diaz": ["Y Díaz","Yainer Díaz","Y Diaz"],
-    "Jesus Sanchez": ["Jesús Sánchez","J Sanchez","Jesus Sánchez"]
+    "Yainer Diaz": ["Y Diaz","Yainer Diaz"],
+    "Jesus Sanchez": ["Jesus Sanchez","J Sanchez"]
   };
   for (const [canon, list] of Object.entries(alias)){
     if (s.toLowerCase() === canon.toLowerCase()) return canon;
