@@ -1,4 +1,4 @@
-// src/MLB.jsx — HOTFIX: fetch from Netlify Blobs public path
+// src/MLB.jsx — HOTFIX: blob→function fallback
 import React, { useEffect, useState } from "react";
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
@@ -7,36 +7,37 @@ async function tryFetchJSON(url){
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`${res.status} ${url}`);
   const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("application/json")){
-    const txt = await res.text();
-    throw new Error(`Non-JSON from ${url}: ${txt.slice(0,80)}`);
-  }
-  return res.json();
+  const isJSON = ct.includes("application/json");
+  const body = isJSON ? await res.json() : await res.text();
+  if (!isJSON) throw new Error(`Non-JSON from ${url}: ${String(body).slice(0,80)}`);
+  return body;
 }
 
 async function ensureLocked(date){
-  const picksUrl = `/.netlify/blobs/picks/${date}.json`;
-  try{
-    return await tryFetchJSON(picksUrl);
-  }catch(e){
-    // Try to generate once then refetch
-    await fetch(`/.netlify/functions/lock_picks`).catch(()=>{});
-    await new Promise(r=> setTimeout(r, 800));
-    return await tryFetchJSON(picksUrl);
+  const blobUrl = `/.netlify/blobs/picks/${date}.json`;
+  try {
+    return await tryFetchJSON(blobUrl);
+  } catch (e) {
+    // Fall back: call function and use its JSON body directly
+    const f = await fetch(`/.netlify/functions/lock_picks`, { method: "GET" });
+    if (!f.ok) throw new Error(`lock_picks failed: ${f.status}`);
+    const payload = await f.json().catch(()=> ({}));
+    // If the function returned the payload directly, use it; otherwise try blob once more
+    if (payload && payload.picks) return payload;
+    await new Promise(r=> setTimeout(r, 700));
+    return await tryFetchJSON(blobUrl);
   }
 }
+
 async function getOdds(date){
-  const oddsUrl = `/.netlify/blobs/odds/${date}.json`;
-  try{
-    return await tryFetchJSON(oddsUrl);
-  }catch{
-    await fetch(`/.netlify/functions/update_odds`).catch(()=>{});
+  const blobUrl = `/.netlify/blobs/odds/${date}.json`;
+  try {
+    return await tryFetchJSON(blobUrl);
+  } catch {
+    const f = await fetch(`/.netlify/functions/update_odds`, { method: "GET" });
+    // odds function returns { ok, size } normally; ignore and just try blob once more
     await new Promise(r=> setTimeout(r, 500));
-    try{
-      return await tryFetchJSON(oddsUrl);
-    }catch{
-      return {};
-    }
+    try { return await tryFetchJSON(blobUrl); } catch { return {}; }
   }
 }
 
@@ -62,7 +63,7 @@ export default function MLB(){
           why: (p.why||[]).join(", ")
         }));
         if (!mounted) return;
-        setMeta({ date: picks.date, locked_at_et: picks.locked_at_et, model_version: picks.model_version });
+        setMeta({ date: picks.date, locked_at_et: picks.locked_at_et || "11:00", model_version: picks.model_version || "—" });
         setRows(merged);
         setStatus({ picks: merged.length, oddsSize: Object.keys(odds).length, merged: merged.length, error: null, refreshed:true });
       }catch(e){
