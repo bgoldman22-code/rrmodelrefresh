@@ -66,7 +66,29 @@ function normalizeCandidates(raw){
   }
   return out;
 }
+useEffect(() => {
+  async function fetchAndLog() {
+    // existing logic: selectHRPicks, scoreHRPick, etc.
+    const candidates = selectHRPicks(...);
 
+    // 🔴 Add log POST here
+    try {
+      await fetch("/.netlify/functions/log_model_day", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          date: new Date().toISOString().slice(0, 10),
+          candidates,
+          meta: { source: "MLB.jsx", algo: "baseline" }
+        })
+      });
+    } catch (e) {
+      console.error("Log post failed", e);
+    }
+  }
+
+  fetchAndLog();
+}, []);
 async function fetchPrimary(){
   try{
     const r = await fetch('/.netlify/functions/odds-mlb-hr');
