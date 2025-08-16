@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { americanFromProb, evFromProbAndOdds } from "./utils/ev.js";
+import { impliedFromAmerican, evFromProbAndOdds } from "./utils/ev.js";
 import { hotColdMultiplier } from "./utils/hotcold.js";
+import { normName, buildWhy } from "./utils/why.js";
 
 const CAL_LAMBDA = 0.25;
 const HOTCOLD_CAP = 0.06;
@@ -100,14 +101,7 @@ export default function MLB(){
     return (1 - CAL_LAMBDA) * p + CAL_LAMBDA * scaled;
   }
 
-  function explainRow(row){
-    const bits = [];
-    bits.push(`base ${(row.baseProb*100).toFixed(1)}%`);
-    if(row.hotBoost && Math.abs(row.hotBoost-1)>1e-3) bits.push(`hot/cold×${row.hotBoost.toFixed(2)}`);
-    if(row.calScale && Math.abs(row.calScale-1)>1e-3) bits.push(`cal×${row.calScale.toFixed(2)}`);
-    return bits.join(" • ");
-  }
-
+  
   async function build(){
     setLoading(true); setMessage(""); setPicks([]);
     try{
