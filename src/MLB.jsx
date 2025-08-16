@@ -3,11 +3,12 @@ import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
 
-const MODEL_VERSION = "1.4.3-hotfix-fuzzy-rr+status";
+const MODEL_VERSION = "1.4.3-hotfix-heuristic-why-footer";
 
 // ---------- helpers ----------
+function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
 function americanFromProb(p){
-  const x = Math.max(1e-6, Math.min(0.999999, Number(p)||0));
+  const x = clamp(Number(p)||0, 1e-6, 0.999999);
   if (x >= 0.5) return -Math.round(100 * x / (1-x));
   return Math.round(100 * (1-x) / x);
 }
@@ -17,18 +18,10 @@ function probFromAmerican(amer){
   if (a > 0) return 100/(a+100);
   return -a/(-a+100);
 }
-function uniqGames(cands){
-  const set = new Set();
-  for (const c of cands){
-    const home = c.home || c.home_team || c.homeTeam;
-    const away = c.away || c.away_team || c.awayTeam || c.opponent;
-    const g = c.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : null);
-    if (g) set.add(g);
-  }
-  return set.size;
-}
+function uniqGamesFromOddsContext(ctx){ return ctx?.games ? ctx.games.size : 0; }
 function cleanName(name){
   if (!name) return "";
+  // strip invisible characters that were leaking into names
   return String(name).replace(/[\u200B-\u200D\u2060]/g, "");
 }
 function stripDiacritics(s){
@@ -42,7 +35,7 @@ function choose(n, k){
   return Math.round(r);
 }
 
-// DO NOT transform names; only trim whitespace
+// Normalize incoming candidates without mutating player names
 function normalizeCandidates(raw){
   const out = [];
   const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
@@ -92,7 +85,7 @@ async function fetchPrimary(){
   try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
 
-// Build a richer odds context: by game+player and by player-only; also infer slate date
+// Build odds context; also infer slate date
 async function fetchOddsContext(){
   const empty = { byGamePlayer: new Map(), byPlayer: new Map(), slateDate: null, games: new Set() };
   try{
@@ -144,7 +137,7 @@ async function fetchOddsContext(){
   }
 }
 
-// fuzzy lookup to rescue names that differ slightly
+// Fuzzy match for odds
 function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   const k1 = `${game}|${name}`.toLowerCase();
   if (byGamePlayer.has(k1)) return byGamePlayer.get(k1);
@@ -154,10 +147,8 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   const last = parts[parts.length-1] || "";
   const firstInit = (parts[0] || "").slice(0,1);
 
-  // First try player-only exact
   if (byPlayer.has(plain)) return byPlayer.get(plain);
 
-  // Then last-name + initial
   let best = null;
   for (const [k,obj] of byPlayer.entries()){
     const p = stripDiacritics(k.replace(/\./g,'')).split(/\s+/);
@@ -169,7 +160,19 @@ function fuzzyLookup(name, game, byGamePlayer, byPlayer){
   return best;
 }
 
-// Simple API health check (shadow) to render bottom status
+// Heuristic prob if model didn't supply one (kept conservative)
+function heuristicProb(p){
+  // Base 3.5% per game target (not per-PA), then add tiny bumps
+  let prob = 0.035;
+  if (p.iso != null) prob += clamp((Number(p.iso)-0.160)*0.20, -0.01, 0.04); // ISO above league adds
+  if (p.barrelRate != null) prob += clamp((Number(p.barrelRate)-0.07)*0.35, -0.01, 0.05);
+  if (p.recentHRperPA != null) prob += clamp(Number(p.recentHRperPA)*0.6, 0, 0.05);
+  if (p.starterHR9 != null) prob += clamp((Number(p.starterHR9)-1.0)*0.015, -0.015, 0.03);
+  prob = clamp(prob, 0.01, 0.20); // cap to sane range
+  return prob;
+}
+
+// Simple API health (for footer)
 async function checkApis(){
   const endpoints = [
     { key: "odds-mlb-hr", url: "/.netlify/functions/odds-mlb-hr" },
@@ -205,13 +208,12 @@ export default function MLB(){
   async function generate(){
     setLoading(true); setMessage(""); setRows([]);
     try{
-      // parallel shadow API checks
       const apiPromise = checkApis();
+      const ctx = await fetchOddsContext(); // get slate date + games even if primary is sparse
 
       let cands = await fetchPrimary();
       let source = "/.netlify/functions/odds-mlb-hr";
       if (!cands.length){
-        const ctx = await fetchOddsContext();
         const fromOdds = Array.from(ctx.byGamePlayer.keys()).map(k => {
           const [g, player] = k.split("|");
           const rec = ctx.byGamePlayer.get(k);
@@ -222,7 +224,8 @@ export default function MLB(){
       }
       if (!cands.length) throw new Error("No candidates (primary and fallback empty)");
 
-      const { byGamePlayer, byPlayer, slateDate, games } = await fetchOddsContext();
+      // Join live odds
+      const { byGamePlayer, byPlayer, slateDate } = ctx;
       cands = cands.map(c => {
         let oddsAmerican = c.oddsAmerican;
         const hit = fuzzyLookup(c.name, c.game, byGamePlayer, byPlayer);
@@ -236,22 +239,19 @@ export default function MLB(){
       const { picks, message: chooseMsg } = selectHRPicks(scored);
       setMessage(chooseMsg || "");
 
-      // Compute odds + EV and suggestion tiers
+      // If model didn't supply prob, use heuristic (so table isn't blank)
       const anchorsSet = new Set(["Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge","Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager","Marcell Ozuna","Kyle Tucker","Rafael Devers"]);
       const anchors = picks.filter(p => anchorsSet.has(String(p.name))).length;
 
       const enriched = picks.map((p) => {
-        const modelProb = (p.p_final ?? p.prob ?? p.p ?? null);
+        let modelProb = (p.p_final ?? p.prob ?? p.p ?? null);
+        if (modelProb == null) modelProb = heuristicProb(p);
         const modelAmerican = modelProb != null ? americanFromProb(modelProb) : null;
         const liveAmerican = Number.isFinite(p.oddsAmerican) ? Math.round(p.oddsAmerican) : null;
-        const fair = modelProb != null ? modelProb : null;
-        let ev = null, edge = null;
-        if (fair != null && liveAmerican != null){
+        let edge = null;
+        if (modelProb != null && liveAmerican != null){
           const liveP = probFromAmerican(liveAmerican);
-          if (liveP != null){
-            edge = (fair - liveP);
-            ev = fair * (Math.abs(liveAmerican)/100) - (1-fair);
-          }
+          if (liveP != null){ edge = (modelProb - liveP); }
         }
         let unit = "1x";
         if (edge != null){
@@ -260,12 +260,16 @@ export default function MLB(){
         } else if (anchorsSet.has(p.name) && modelProb && modelProb >= 0.12) {
           unit = "2x";
         }
-        return { ...p, modelProb, modelAmerican, liveAmerican, ev, edge, unit };
+        return { ...p, modelProb, modelAmerican, liveAmerican, edge, unit };
       });
 
-      // Round-robin suggestions
-      const sorted = enriched.slice().sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
-      const topN = sorted.slice(0, Math.min(8, sorted.length));
+      // Filter out obvious junk late-night: require either live odds present OR modelProb >= 6%
+      const filtered = enriched.filter(p => (p.liveAmerican != null) || (p.modelProb != null && p.modelProb >= 0.06));
+
+      // Sort by edge then prob; keep top 12
+      const sorted = filtered.slice().sort((a,b)=> (b.edge??-1) - (a.edge??-1) || (b.modelProb??0) - (a.modelProb??0));
+      const topN = sorted.slice(0, 12);
+
       const rr2 = choose(topN.length, 2);
       const rr3 = choose(topN.length, 3);
       const unitMemo = (()=>{
@@ -275,15 +279,15 @@ export default function MLB(){
         return `${c3}×3u, ${c2}×2u, ${c1}×1u across ${topN.length} legs`;
       })();
 
-      const probs = enriched.map(p => p.modelProb).filter(x => Number.isFinite(x));
+      const probs = topN.map(p => p.modelProb).filter(x => Number.isFinite(x));
       const avgProb = probs.length ? (100*probs.reduce((a,b)=>a+b,0)/probs.length) : null;
-      const liveOddsCount = enriched.filter(p => Number.isFinite(p.liveAmerican)).length;
-      const liveOddsPct = enriched.length ? Math.round(100 * liveOddsCount / enriched.length) : 0;
+      const liveOddsCount = topN.filter(p => Number.isFinite(p.liveAmerican)).length;
+      const liveOddsPct = topN.length ? Math.round(100 * liveOddsCount / topN.length) : 0;
 
       const api = await apiPromise;
-      setDiag(d => ({ ...d, source, count: cands.length, games: games.size || uniqGames(cands), picks: enriched.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, api }));
+      setDiag(d => ({ ...d, source, count: cands.length, games: uniqGamesFromOddsContext(ctx) || 0, picks: topN.length, anchors, avgProb, liveOddsPct, slateDate, rr2, rr3, unitMemo, api }));
 
-      const ui = enriched.map((p) => ({
+      const ui = topN.map((p) => ({
         name: cleanName(p.name||""),
         team: p.team||"—",
         game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
@@ -303,15 +307,14 @@ export default function MLB(){
             date: new Date().toISOString().slice(0,10),
             model_version: MODEL_VERSION,
             candidates: cands.length,
-            games_seen: new Set(cands.map(c => c.game || (c.away && c.home ? `${c.away}@${c.home}` : ""))).size,
-            bullpen_adjustment: { enabled: false, avg_delta_pp: 0, pct_gt_0_2pp: 0 },
+            games_seen: ctx.games.size,
             rr: { rr2, rr3, unitMemo },
-            picks: enriched.map(p => ({
+            picks: ui.map(p => ({
               player: p.name,
               prob_pp: p.modelProb != null ? +(p.modelProb*100).toFixed(1) : null,
-              live_amer: p.liveAmerican,
+              live_amer: p.oddsAmerican,
               unit: p.unit,
-              why: buildWhy(p)
+              why: p.why
             }))
           };
           const resp = await fetch('/.netlify/functions/log_model_day', {
@@ -335,22 +338,59 @@ export default function MLB(){
 
   useEffect(()=>{ generate(); }, []);
 
-  // Rich WHY text builder, but concise and varied
+  // WHY text: varied and human
   function buildWhy(p){
-    const bits = [];
-    if (p.oppThrows){ bits.push(`vs ${String(p.oppThrows).toUpperCase()}HP`); }
-    if (p.iso != null) bits.push(`ISO ${(Number(p.iso)).toFixed(3)}`);
-    if (p.barrelRate != null) bits.push(`barrel ${(p.barrelRate*100).toFixed(1)}%`);
-    if (p.recentHRperPA != null) bits.push(`L15 ${(p.recentHRperPA*100).toFixed(1)}% HR/PA`);
-    if (p.starterHR9 != null) bits.push(`opp ${Number(p.starterHR9).toFixed(2)} HR/9`);
-    if (p.expPA != null) bits.push(`~${p.expPA} PAs`);
+    const facts = [];
+
+    // Handedness split preference
+    if (p.oppThrows && p.bats){
+      facts.push(`${p.bats.toUpperCase()} vs ${p.oppThrows.toUpperCase()} match-up`);
+    } else if (p.oppThrows){
+      facts.push(`faces a ${p.oppThrows.toUpperCase()}HP`);
+    }
+
+    // Power signatures
+    if (p.iso != null){
+      const iso = Number(p.iso);
+      if (iso >= 0.220) facts.push(`extra-base profile (ISO ${iso.toFixed(3)})`);
+      else if (iso >= 0.180) facts.push(`solid pop (ISO ${iso.toFixed(3)})`);
+    }
+    if (p.barrelRate != null){
+      const br = Number(p.barrelRate)*100;
+      if (br >= 10) facts.push(`barrels ${br.toFixed(1)}%`);
+    }
+    if (p.fbPct != null && p.pullPct != null){
+      const fb = Number(p.fbPct)*100, pl = Number(p.pullPct)*100;
+      if (fb >= 35 && pl >= 40) facts.push(`air + pull combo (${fb.toFixed(0)}% FB, ${pl.toFixed(0)}% pull)`);
+    }
+
+    // Recent form
+    if (p.recentHRperPA != null){
+      const r = Number(p.recentHRperPA)*100;
+      if (r >= 2.0) facts.push(`L15 HR/PA ${r.toFixed(1)}%`);
+    }
+
+    // Opponent starter HR/9
+    if (p.starterHR9 != null){
+      const s = Number(p.starterHR9);
+      if (s >= 1.3) facts.push(`opponent allows ${s.toFixed(2)} HR/9`);
+    }
+
+    // BvP fun fact (only if real sample)
+    if (p.bvpPA != null && p.bvpPA >= 8 && p.bvpHR >= 1){
+      facts.push(`BvP: ${p.bvpHR} HR in ${p.bvpPA} PA`);
+    }
+
+    // PAs context
+    if (p.expPA != null) facts.push(`~${p.expPA} PAs`);
+
     const head = cleanName(p.name||"");
     const ctx = p.game ? ` (${p.game})` : "";
-    const tail = bits.slice(0,4).join(" • ");
-    return tail ? `${head}${ctx} — ${tail}` : `${head}${ctx}`;
+    if (!facts.length) return `${head}${ctx} — trending power spot.`;
+    return `${head}${ctx} — ${facts.slice(0,4).join(" • ")}`;
   }
 
-  // Color chip helper
+  // Simple pill
   function Chip({ok, children}){
     return <span className={ok ? "inline-block px-2 py-0.5 rounded bg-green-100 text-green-800" : "inline-block px-2 py-0.5 rounded bg-red-100 text-red-800"}>{children}</span>;
   }
@@ -358,7 +398,7 @@ export default function MLB(){
   return (
     <div className="p-6">
       <h1 className="text-2xl font-bold mb-2">
-        MLB — Home Run Picks {diag.slateDate ? <span className="text-base font-normal text-gray-600">({diag.slateDate})</span> : null}
+        MLB — Home Run Picks
       </h1>
       <p className="text-sm text-gray-600 mb-4">
         Source: {diag.source} • Candidates: {diag.count} • Games seen: {diag.games}
@@ -373,6 +413,7 @@ export default function MLB(){
           {loading ? "Generating…" : "Generate"}
         </button>
         {message ? <span className="text-sm text-gray-700">{message}</span> : null}
+        {diag.slateDate ? <span className="text-sm text-gray-500">Slate: {diag.slateDate}</span> : null}
       </div>
 
       {rows.length ? (
@@ -410,33 +451,50 @@ export default function MLB(){
         <div className="text-gray-500">No picks yet.</div>
       )}
 
-      {/* Footer diagnostics with green/red chips, RR info, API + learning status */}
+      {/* Footer: diagnostics + RR + API health in a compact table */}
       <div className="mt-6 text-sm text-gray-700 space-y-3">
-        <div><strong>Diagnostics:</strong></div>
         <div className="flex flex-wrap gap-2">
           <Chip ok={diag.picks>=8}>Picks: {diag.picks}</Chip>
           <Chip ok={diag.anchors>=2}>Anchors: {diag.anchors}</Chip>
           <Chip ok={diag.avgProb!=null && diag.avgProb>=12}>Avg prob: {diag.avgProb!=null ? diag.avgProb.toFixed(1)+'%' : '—'}</Chip>
           <Chip ok={diag.liveOddsPct!=null && diag.liveOddsPct>=70}>Live odds coverage: {diag.liveOddsPct!=null ? diag.liveOddsPct+'%' : '—'}</Chip>
         </div>
-        <div>
-          <strong>RR Guide:</strong> 2-legs = {diag.rr2}, 3-legs = {diag.rr3} • Suggested sizing: {diag.unitMemo}
-        </div>
-        <div>
-          <strong>API status:</strong>
-          <div className="flex flex-wrap gap-2 mt-1">
-            {diag.api.map(a => (
-              <Chip key={a.key} ok={a.ok}>
-                {a.key}: {a.ok ? `${a.ms}ms` : "down"}
-              </Chip>
-            ))}
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Chip ok={diag.logOk===true}>Model log: {diag.logOk===true ? "posted" : (diag.logOk===false ? "failed" : "pending")}</Chip>
-          <Chip ok={!diag.learn.promoted}>Bullpen shadow: {diag.learn.bullpen_shadow ? "on" : "off"}</Chip>
-          <Chip ok={true}>Version: {MODEL_VERSION}</Chip>
-          <Chip ok={true}>Features: fuzzy_match • rr_units</Chip>
+        <div><strong>RR Guide:</strong> 2-legs = {diag.rr2}, 3-legs = {diag.rr3} • Suggested sizing: {diag.unitMemo}</div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-[420px] border">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-3 py-1 text-left">Endpoint</th>
+                <th className="px-3 py-1 text-left">Status</th>
+                <th className="px-3 py-1 text-left">Latency</th>
+              </tr>
+            </thead>
+            <tbody>
+              {diag.api.map(a => (
+                <tr key={a.key} className="border-t">
+                  <td className="px-3 py-1">{a.key}</td>
+                  <td className="px-3 py-1">{a.ok ? "OK" : "DOWN"}</td>
+                  <td className="px-3 py-1">{a.ms}ms</td>
+                </tr>
+              ))}
+              <tr className="border-t">
+                <td className="px-3 py-1">Model log</td>
+                <td className="px-3 py-1">{diag.logOk===true ? "posted" : (diag.logOk===false ? "failed" : "pending")}</td>
+                <td className="px-3 py-1">—</td>
+              </tr>
+              <tr className="border-t">
+                <td className="px-3 py-1">Learning</td>
+                <td className="px-3 py-1">{diag.learn.bullpen_shadow ? "bullpen shadow on" : "off"}</td>
+                <td className="px-3 py-1">—</td>
+              </tr>
+              <tr className="border-t">
+                <td className="px-3 py-1">Version</td>
+                <td className="px-3 py-1">{MODEL_VERSION}</td>
+                <td className="px-3 py-1">—</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
