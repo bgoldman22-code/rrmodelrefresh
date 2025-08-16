@@ -1,12 +1,6 @@
 \
 // models/hr_select.js
-import { normalizePlayerName } from "../src/lib/common/name_map.js";
-
-const POWER_ANCHORS = new Set([
-  "Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge",
-  "Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager",
-  "Marcell Ozuna","Kyle Tucker","Rafael Devers"
-]);
+const ANCHORS = new Set(["Kyle Schwarber","Shohei Ohtani","Cal Raleigh","Juan Soto","Aaron Judge","Yordan Alvarez","Pete Alonso","Gunnar Henderson","Matt Olson","Corey Seager","Marcell Ozuna","Kyle Tucker","Rafael Devers"]);
 
 function keyGame(x){
   const home = x.home || x.home_team || x.homeTeam;
@@ -39,7 +33,7 @@ export function selectHRPicks(scored){
     return true;
   }
 
-  const anchors = sorted.filter(x => POWER_ANCHORS.has(normalizePlayerName(x.name)) && (x.p_final ?? 0) >= anchorFloor);
+  const anchors = sorted.filter(x => ANCHORS.has(String(x.name)) && (x.p_final ?? 0) >= anchorFloor);
   for (const a of anchors){
     if (picks.length >= maxPicks) break;
     tryAdd(a);
@@ -51,7 +45,7 @@ export function selectHRPicks(scored){
     tryAdd(x);
   }
 
-  const haveAnchors = picks.filter(x => POWER_ANCHORS.has(normalizePlayerName(x.name))).length;
+  const haveAnchors = picks.filter(x => ANCHORS.has(String(x.name))).length;
   const message = `Picked ${picks.length} • Anchors included: ${haveAnchors} • Games ${new Set(picks.map(keyGame)).size}`;
   return { picks, message };
 }

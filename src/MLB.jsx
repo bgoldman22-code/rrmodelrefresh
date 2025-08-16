@@ -3,7 +3,6 @@
 import React, { useEffect, useState } from "react";
 import { scoreHRPick } from "./models/hr_scoring.js";
 import { selectHRPicks } from "./models/hr_select.js";
-import { normalizePlayerName } from "./lib/common/name_map.js";
 
 function americanFromProb(p){
   const x = Math.max(1e-6, Math.min(0.999999, Number(p)||0));
@@ -21,25 +20,26 @@ function uniqGames(cands){
   return set.size;
 }
 
+// DO NOT transform names; only trim whitespace
 function normalizeCandidates(raw){
   const out = [];
-  if (!raw) return out;
-  const norm = (s)=>{
-    try{ return normalizePlayerName(s); }catch{return s||"";}
-  };
-  const push = (obj) => {
+  const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
+  const push = (obj)=>{
     if (!obj) return;
-    const name = norm(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
+    const name = clean(obj.name || obj.player || obj.description || obj.outcome || obj.playerName || "");
     const home = obj.home || obj.home_team || obj.homeTeam || obj.teamHome;
     const away = obj.away || obj.away_team || obj.awayTeam || obj.teamAway || obj.opponent;
-    const game = obj.game || (home && away ? `${String(away).trim()}@${String(home).trim()}` : "AWY@HOM");
-    const odds = obj.oddsAmerican ?? obj.odds ?? obj.price ?? obj.american ?? null;
+    const game = obj.game || (home && away ? `${clean(away)}@${clean(home)}` : "AWY@HOM");
+    const rawOdds = obj.oddsAmerican ?? obj.odds ?? obj.price ?? obj.american ?? null;
+    let oddsAmerican = Number(rawOdds);
+    if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) oddsAmerican = null;
     out.push({
       id: obj.id || obj.playerId || `${name}|${game}`,
-      name, team: obj.team || obj.playerTeam || obj.team_abbr || obj.teamAbbr || "—",
-      home, away, game,
+      name,
+      team: clean(obj.team || obj.playerTeam || obj.team_abbr || obj.teamAbbr || "—"),
+      home: clean(home), away: clean(away), game,
       eventId: obj.eventId || obj.event_id || obj.id || obj.gameId || obj.gamePk,
-      oddsAmerican: Number.isFinite(Number(odds)) ? Number(odds) : null,
+      oddsAmerican,
       expPA: obj.expPA ?? obj.pa ?? 4,
       venue: obj.venue || obj.park || obj.venueName || obj.venue_name || null,
       starterHR9: obj.starterHR9 ?? obj.pitcherHR9 ?? obj.oppStarterHR9 ?? null,
@@ -67,36 +67,28 @@ function normalizeCandidates(raw){
 }
 
 async function fetchPrimary(){
-  try{
-    const r = await fetch('/.netlify/functions/odds-mlb-hr');
-    if(!r.ok) return [];
-    const j = await r.json();
-    return normalizeCandidates(j);
-  }catch{ return []; }
+  try{ const r = await fetch('/.netlify/functions/odds-mlb-hr'); if(!r.ok) return []; return normalizeCandidates(await r.json()); }catch{ return []; }
 }
 async function fetchFallback(){
-  const url = '/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us';
   try{
-    const r = await fetch(url);
+    const r = await fetch('/.netlify/functions/odds-props?league=mlb&markets=player_home_runs,player_to_hit_a_home_run&regions=us');
     if(!r.ok) return [];
     const data = await r.json();
     const out = [];
-    const norm = (s)=>{
-      try{ return normalizePlayerName(s); }catch{return s||"";}
-    };
+    const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
     for (const ev of (data?.events||[])){
       const home = ev.home_team || ev.homeTeam || "";
       const away = ev.away_team || ev.awayTeam || "";
-      const game = away && home ? `${String(away).trim()}@${String(home).trim()}` : (ev.id || "");
+      const game = away && home ? `${clean(away)}@${clean(home)}` : (ev.id || "");
       for (const bk of (ev.bookmakers||[])){
         for (const mk of (bk.markets||[])){
           const key = (mk.key||mk.key_name||mk.market||"").toLowerCase();
           const isHR = (key.includes("home") && key.includes("run")) || key.includes("player_home_runs") || key.includes("player_to_hit_a_home_run");
           if (!isHR) continue;
           for (const oc of (mk.outcomes||[])){
-            const player = norm(oc.name || oc.description || oc.participant || "");
-            const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
-            if (!player || !Number.isFinite(price)) continue;
+            const player = clean(oc.name || oc.description || oc.participant || "");
+            let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
+            if (!player || !Number.isFinite(price) || price === 0) continue;
             out.push({ name: player, home, away, game, eventId: ev.id, oddsAmerican: price });
           }
         }
@@ -111,18 +103,16 @@ async function fetchHROddsIndex(){
     if(!r.ok) return new Map();
     const data = await r.json();
     const map = new Map();
-    const norm = (s)=>{
-      try{ return normalizePlayerName(s); }catch{return s||"";}
-    };
+    const clean = (s)=> (s==null? "" : String(s).replace(/\s+/g,' ').trim());
     if(Array.isArray(data?.events)){
       for (const ev of data.events){
-        const gameCode = (ev?.home_team && ev?.away_team) ? `${ev.away_team}@${ev.home_team}` : (ev?.id || ev?.commence_time || "");
+        const gameCode = (ev?.home_team && ev?.away_team) ? `${clean(ev.away_team)}@${clean(ev.home_team)}` : (ev?.id || ev?.commence_time || "");
         for (const bk of (ev.bookmakers||[])){
           for (const mk of (bk.markets||[])){
             for (const oc of (mk.outcomes||[])){
-              const player = norm(oc.name || oc.description || oc.participant || "");
-              const price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
-              if (!player || !Number.isFinite(price)) continue;
+              const player = clean(oc.name || oc.description || oc.participant || "");
+              let price = Number(oc.price_american ?? oc.price?.american ?? oc.price ?? oc.american ?? oc.odds);
+              if (!player || !Number.isFinite(price) || price === 0) continue;
               const key = `${gameCode}|${player}`.toLowerCase();
               if (!map.has(key) || Math.abs(price) < Math.abs(map.get(key))) map.set(key, price);
             }
@@ -151,32 +141,35 @@ export default function MLB(){
       }
       if (!cands.length) throw new Error("No candidates (primary and fallback empty)");
 
-      // Join live odds when available
       const idx = await fetchHROddsIndex();
       cands = cands.map(c => {
-        const key = `${c.game}|${normalizePlayerName(c.name||"")}`.toLowerCase();
+        const key = `${c.game}|${c.name}`.toLowerCase();
         const joined = idx.get(key);
-        return { ...c, oddsAmerican: Number.isFinite(joined) ? joined : c.oddsAmerican };
+        let oddsAmerican = Number.isFinite(joined) ? joined : c.oddsAmerican;
+        if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) oddsAmerican = null;
+        return { ...c, oddsAmerican };
       });
 
-      // Score & select
       const scored = cands.map(scoreHRPick);
       const { picks, message: chooseMsg } = selectHRPicks(scored);
       setDiag({ source, count: cands.length, games: uniqGames(cands) });
       setMessage(chooseMsg || "");
 
-      const ui = picks.map((p) => ({
-        name: p.name,
-        team: p.team||"—",
-        game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
-        modelProb: p.p_final ?? null,
-        modelAmerican: p.modelAmerican ?? (p.p_final ? americanFromProb(p.p_final) : null),
-        oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
-        why: p.why2 || p.why || "—",
-      }));
+      const ui = picks.map((p) => {
+        // protect first letter from any ::first-letter CSS rules that might hide it
+        const safeName = "\\u2060" + String(p.name||"");
+        return {
+          name: safeName,
+          team: p.team||"—",
+          game: (p.away && p.home) ? `${p.away}@${p.home}` : (p.game || "—"),
+          modelProb: p.p_final ?? null,
+          modelAmerican: p.modelAmerican ?? (p.p_final ? americanFromProb(p.p_final) : null),
+          oddsAmerican: (p.oddsAmerican != null) ? Math.round(Number(p.oddsAmerican)) : null,
+          why: p.why2 || p.why || "—",
+        };
+      });
       setRows(ui);
 
-      // ---- fire-and-forget daily log to Netlify Blobs via function ----
       (async ()=>{
         try{
           const payload = {
@@ -201,7 +194,6 @@ export default function MLB(){
           });
         }catch{}
       })();
-      // -----------------------------------------------------------------
 
     }catch(e){
       setMessage(String(e?.message||e));
@@ -214,54 +206,48 @@ export default function MLB(){
   useEffect(()=>{ generate(); }, []);
 
   return (
-    <div className="p-6">
-      <h1 className="text-2xl font-bold mb-2">MLB — Home Run Picks</h1>
-      <p className="text-sm text-gray-600 mb-4">
-        Source: {diag.source} • Candidates: {diag.count} • Games seen: {diag.games}
-      </p>
+    <div>
+      <h1>MLB — Home Run Picks</h1>
+      <p>Source: {diag.source} • Candidates: {diag.count} • Games seen: {diag.games}</p>
 
-      <div className="flex items-center gap-3 mb-4">
-        <button
-          className="px-4 py-2 bg-blue-600 text-white rounded-md shadow hover:bg-blue-700 disabled:opacity-60"
-          onClick={generate}
-          disabled={loading}
-        >
+      <div>
+        <button onClick={generate} disabled={loading}>
           {loading ? "Generating…" : "Generate"}
         </button>
-        {message ? <span className="text-sm text-gray-700">{message}</span> : null}
+        {message ? <span> {message}</span> : null}
       </div>
 
       {rows.length ? (
-        <div className="overflow-x-auto">
-          <table className="min-w-full border">
-            <thead className="bg-gray-100">
+        <div style={{overflowX:'auto'}}>
+          <table>
+            <thead>
               <tr>
-                <th className="px-4 py-2 text-left">Player</th>
-                <th className="px-4 py-2 text-left">Team</th>
-                <th className="px-4 py-2 text-left">Game</th>
-                <th className="px-4 py-2 text-left">Model HR Prob</th>
-                <th className="px-4 py-2 text-left">Model Odds</th>
-                <th className="px-4 py-2 text-left">Live Odds</th>
-                <th className="px-4 py-2 text-left">Why</th>
+                <th>Player</th>
+                <th>Team</th>
+                <th>Game</th>
+                <th>Model HR Prob</th>
+                <th>Model Odds</th>
+                <th>Live Odds</th>
+                <th>Why</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((p, idx) => (
-                <tr key={idx} className="border-t align-top">
-                  <td className="px-4 py-2">{p.name}</td>
-                  <td className="px-4 py-2">{p.team}</td>
-                  <td className="px-4 py-2">{p.game}</td>
-                  <td className="px-4 py-2">{p.modelProb != null ? (p.modelProb*100).toFixed(1) + "%" : "—"}</td>
-                  <td className="px-4 py-2">{p.modelAmerican != null ? (p.modelAmerican>0?`+${p.modelAmerican}`:p.modelAmerican) : "—"}</td>
-                  <td className="px-4 py-2">{p.oddsAmerican != null ? (p.oddsAmerican>0?`+${p.oddsAmerican}`:p.oddsAmerican) : "—"}</td>
-                  <td className="px-4 py-2 text-sm">{p.why}</td>
+                <tr key={idx}>
+                  <td>{p.name}</td>
+                  <td>{p.team}</td>
+                  <td>{p.game}</td>
+                  <td>{p.modelProb != null ? (p.modelProb*100).toFixed(1) + "%" : "—"}</td>
+                  <td>{p.modelAmerican != null ? (p.modelAmerican>0?`+${p.modelAmerican}`:p.modelAmerican) : "—"}</td>
+                  <td>{p.oddsAmerican != null ? (p.oddsAmerican>0?`+${p.oddsAmerican}`:p.oddsAmerican) : "—"}</td>
+                  <td>{p.why}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       ) : (
-        <div className="text-gray-500">No picks yet.</div>
+        <div>No picks yet.</div>
       )}
     </div>
   );
